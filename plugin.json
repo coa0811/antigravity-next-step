@@ -1,0 +1,12 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "next-step",
+  "displayName": "Next Step HUD",
+  "version": "0.2.2",
+  "description": "Captures deterministic approval prompts and agent-declared next actions via lifecycle hooks and MCP, displaying at-a-glance session status (what is next, who acts, whether waiting on user) in a read-only HUD.",
+  "suggestedPrompts": [
+    "查看当前会话的下一步指令状态并打开 Next Step HUD",
+    "调用 next_step_get 检查是否有待处理的审批或下一步动作",
+    "使用 next_step_publish 显式发布当前任务的下一步执行计划"
+  ]
+}

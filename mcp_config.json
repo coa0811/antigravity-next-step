@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "next_step": {
+      "command": "/bin/sh",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/run_python.sh",
+        "-u",
+        "${PLUGIN_ROOT}/scripts/next_step_mcp_server.py"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

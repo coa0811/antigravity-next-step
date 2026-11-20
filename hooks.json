@@ -1,0 +1,50 @@
+{
+  "next-step-lifecycle": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "./scripts/run_python.sh ./scripts/next_step_hook.py --event session-start",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "./scripts/run_python.sh ./scripts/next_step_hook.py --event pre-invocation",
+        "timeout": 5
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/run_python.sh ./scripts/next_step_hook.py --event pre-tool-use",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/run_python.sh ./scripts/next_step_hook.py --event post-tool-use",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "./scripts/run_python.sh ./scripts/next_step_hook.py --event stop",
+        "timeout": 10
+      }
+    ]
+  }
+}
