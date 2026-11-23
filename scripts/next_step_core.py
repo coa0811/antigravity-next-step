@@ -753,9 +753,212 @@ def format_session_markdown(state: dict[str, Any]) -> str:
     if isinstance(plan, dict) and plan.get("path"):
         plan_status = "🟡 已过期（文件已改写）" if plan.get("stale") else "未过期"
         lines.append(f"- **关联计划工件**：`{plan.get('name') or plan['path']}`（{plan_status}）")
-    if ev.get("suggestedPrompt") and not ev.get("stale"):
+    copy_blocked = bool(ev.get("stale") or (isinstance(plan, dict) and plan.get("stale")))
+    if ev.get("suggestedPrompt") and not copy_blocked:
         lines.append(f"- **建议下一条指令（只读复制，由你决定是否提交）**：\n  ```text\n  {ev['suggestedPrompt']}\n  ```")
+    elif ev.get("suggestedPrompt") and copy_blocked:
+        lines.append("- **建议下一条指令**：`🟡 已过期，已阻止直接复制`")
     return "\n".join(lines)
+
+
+def _clip_str(val: Any, max_len: int) -> str | None:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    if len(s) <= max_len:
+        return s
+    return s[: max(0, max_len - 1)] + "…"
+
+
+def build_session_panel_item(state: dict[str, Any], now: float | None = None) -> dict[str, Any]:
+    """Build a bounded, strictly read-only structured view model for one session."""
+    ev = evaluate_staleness(state, now=now)
+    cid = str(ev.get("conversationId") or "default")
+    short_id = str(ev.get("shortId") or cid[:8])
+    ws_list = [str(w) for w in (ev.get("workspacePaths") or []) if w]
+    ws_name = Path(ws_list[0]).name if ws_list else "default-workspace"
+
+    plan = ev.get("planArtifact")
+    plan_item: dict[str, Any] | None = None
+    if isinstance(plan, dict) and plan.get("path"):
+        plan_item = {
+            "path": _clip_str(plan.get("path"), 500),
+            "name": _clip_str(plan.get("name") or Path(str(plan["path"])).name, 160),
+            "sha256": plan.get("sha256"),
+            "stale": bool(plan.get("stale", False)),
+            "staleReason": _clip_str(plan.get("staleReason"), 200),
+        }
+
+    active_tool = ev.get("activeTool")
+    tool_item: dict[str, Any] | None = None
+    if isinstance(active_tool, dict) and active_tool.get("name"):
+        tool_item = {
+            "name": _clip_str(active_tool.get("name"), 120),
+            "summary": _clip_str(active_tool.get("summary"), 240),
+            "approvalHint": _clip_str(active_tool.get("approvalHint"), 240),
+            "elapsedSec": active_tool.get("elapsedSec"),
+        }
+
+    is_stale = bool(ev.get("stale", False))
+    copy_blocked = bool(is_stale or (isinstance(plan_item, dict) and plan_item.get("stale")))
+    raw_opts = ev.get("options") or []
+    options = [
+        clipped
+        for clipped in (_clip_str(opt, 300) for opt in raw_opts[:12])
+        if clipped
+    ]
+
+    waiting_on_user = bool(ev.get("waitingOnUser", False))
+    actor = str(ev.get("actor") or "none")
+    raw_prompt = ev.get("suggestedPrompt")
+    suggested_prompt = (
+        str(raw_prompt).strip() or None
+        if raw_prompt is not None
+        else None
+    )
+    return {
+        "conversationId": cid,
+        "shortId": short_id,
+        "workspaceName": ws_name,
+        "workspacePaths": ws_list[:4],
+        "modelName": _clip_str(ev.get("modelName"), 120),
+        "lastUserInput": _clip_str(ev.get("lastUserInput"), 240),
+        "lifecycle": str(ev.get("lifecycle") or "IDLE"),
+        "sourceType": str(ev.get("sourceType") or "NONE"),
+        "confidence": str(ev.get("confidence") or "DETERMINISTIC"),
+        "waitingOnUser": waiting_on_user,
+        "actor": actor,
+        "actorLabel": format_actor_label(actor, waiting_on_user),
+        "statusBadge": format_status_badge(ev),
+        "sourceLabel": format_source_label(ev.get("sourceType"), ev.get("confidence")),
+        "nextAction": _clip_str(ev.get("nextAction"), 500),
+        "detail": _clip_str(ev.get("detail"), 1500),
+        "options": options,
+        "suggestedPrompt": suggested_prompt,
+        "copyBlocked": copy_blocked,
+        "stale": is_stale,
+        "staleReason": _clip_str(ev.get("staleReason"), 240),
+        "planArtifact": plan_item,
+        "activeTool": tool_item,
+        "updatedAt": ev.get("updatedAt"),
+        "updatedAtIso": ev.get("updatedAtIso") or "",
+    }
+
+
+def build_side_panel_payload(
+    bound_cid: str | None = None,
+    binding_mode: str = "unbound",
+    workspace_filter: str | None = None,
+    limit: int = 20,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Build strictly read-only, session-isolated payload for the MCP Apps Side Panel."""
+    cur_now = time.time() if now is None else now
+    clean_cid = str(bound_cid or "").strip() or None
+    all_sessions = list_all_sessions(workspace_filter=workspace_filter, now=cur_now)
+    all_global = (
+        list_all_sessions(workspace_filter=None, now=cur_now)
+        if workspace_filter and clean_cid
+        else all_sessions
+    )
+
+    eff_mode = "unbound"
+    resolved_cid: str | None = None
+    selected_item: dict[str, Any] | None = None
+    not_found = False
+    ambiguous = False
+
+    if clean_cid:
+        sp = session_path(clean_cid)
+        if sp.is_file():
+            raw_state = load_session(clean_cid)
+            selected_item = build_session_panel_item(raw_state, now=cur_now)
+            resolved_cid = selected_item["conversationId"]
+            eff_mode = binding_mode if binding_mode in ("hook_bound", "explicit") else "explicit"
+        else:
+            matches = [
+                s for s in all_global if str(s.get("conversationId") or "").startswith(clean_cid)
+            ]
+            if len(matches) == 1:
+                selected_item = build_session_panel_item(matches[0], now=cur_now)
+                resolved_cid = selected_item["conversationId"]
+                eff_mode = binding_mode if binding_mode in ("hook_bound", "explicit") else "explicit"
+            elif len(matches) > 1:
+                ambiguous = True
+                eff_mode = "unbound"
+            else:
+                not_found = True
+                resolved_cid = clean_cid
+                eff_mode = binding_mode if binding_mode in ("hook_bound", "explicit") else "explicit"
+
+    session_items = [build_session_panel_item(s, now=cur_now) for s in all_sessions[: max(1, limit)]]
+    return {
+        "version": "0.3.0",
+        "generatedAtIso": iso_now(cur_now),
+        "bindingMode": eff_mode,
+        "boundConversationId": resolved_cid,
+        "sessionNotFound": not_found,
+        "ambiguousPrefix": ambiguous,
+        "selectedSession": selected_item,
+        "sessions": session_items,
+        "totalSessions": len(all_sessions),
+        "waitingCount": sum(1 for s in all_sessions if s.get("waitingOnUser")),
+    }
+
+
+def format_side_panel_text(payload: dict[str, Any]) -> str:
+    """Format concise plain-text Markdown fallback for non-UI MCP clients."""
+    mode = payload.get("bindingMode")
+    cid = payload.get("boundConversationId")
+    sessions = payload.get("sessions") or []
+
+    if mode == "unbound":
+        header = (
+            "**Next Step HUD（未绑定当前会话）**："
+            + (
+                "传入的会话前缀匹配多个会话，已回退为未绑定状态。\n\n"
+                if payload.get("ambiguousPrefix")
+                else "未传入 `conversation_id` 且无宿主 Hook 绑定，以下列出已记录会话（不自动猜测当前会话）：\n\n"
+            )
+        )
+        if not sessions:
+            return header + "当前暂无已记录的会话状态。"
+        lines = [header.rstrip()]
+        for item in sessions[:10]:
+            action = item.get("nextAction") or "当前无已声明的下一步"
+            lines.append(
+                f"- `#{item['shortId']}` · `{item['workspaceName']}` · `{item['statusBadge']}` · {action}"
+            )
+        return "\n".join(lines)
+
+    if payload.get("sessionNotFound"):
+        return f"**Next Step HUD（已绑定会话 `{str(cid)[:8]}`）**：尚无该会话的状态记录（尚未触发 Hook 或发布下一步）。"
+
+    sel = payload.get("selectedSession")
+    if isinstance(sel, dict):
+        # Reuse format_session_markdown directly if the session file exists on disk
+        if cid and session_path(str(cid)).is_file():
+            return format_session_markdown(load_session(str(cid)))
+        next_act = sel.get("nextAction") or "当前无已声明的下一步"
+        lines = [
+            f"### 会话 `#{sel['shortId']}` · `{sel['workspaceName']}`",
+            f"- **完整会话 ID**：`{sel['conversationId']}`",
+            f"- **是否在等我**：`{sel['statusBadge']}`",
+            f"- **由谁做**：`{sel['actorLabel']}`",
+            f"- **接下来要做什么**：**{next_act}**",
+            f"- **来源与可信度**：`{sel['sourceLabel']}`",
+        ]
+        if sel.get("stale") and sel.get("staleReason"):
+            lines.append(f"- **过期提示**：`🟡 {sel['staleReason']}`")
+        if sel.get("suggestedPrompt") and not sel.get("copyBlocked"):
+            lines.append(f"- **建议下一条指令（只读复制）**：`{sel['suggestedPrompt']}`")
+        elif sel.get("suggestedPrompt") and sel.get("copyBlocked"):
+            lines.append("- **建议下一条指令**：`🟡 已过期，已阻止直接复制`")
+        return "\n".join(lines)
+
+    return "当前暂无已记录的会话状态。"
 
 
 def write_snapshots(latest_state: dict[str, Any] | None = None, now: float | None = None) -> None:

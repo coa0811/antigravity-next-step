@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,28 @@ import next_step_floating  # noqa: E402
 import next_step_hud_server as hud_server  # noqa: E402
 
 SERVER_NAME = "next-step"
-SERVER_VERSION = "0.2.2"
-SUPPORTED_PROTOCOL_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
+SERVER_VERSION = "0.3.0"
+SUPPORTED_PROTOCOL_VERSIONS = {
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    "2025-11-25",
+    "2026-01-26",
+}
+
+SIDE_PANEL_URI = "ui://next-step/side-panel.html"
+MCP_APP_MIME_TYPE = "text/html;profile=mcp-app"
+SIDE_PANEL_HTML_PATH = SCRIPT_DIR.parent / "ui" / "side-panel.html"
+MAX_UI_RESOURCE_BYTES = 10 * 1024 * 1024
+
+RESOURCES: list[dict[str, Any]] = [
+    {
+        "uri": SIDE_PANEL_URI,
+        "name": "Next Step HUD Side Panel",
+        "description": "Read-only Next Step HUD interactive Side Panel UI (MCP App)",
+        "mimeType": MCP_APP_MIME_TYPE,
+    }
+]
 
 TOOLS: list[dict[str, Any]] = [
     {
@@ -96,7 +117,79 @@ TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "name": "next_step_side_panel",
+        "title": "Next Step HUD",
+        "description": (
+            "Open or update the read-only Next Step HUD native Side Panel for Antigravity. "
+            "Displays session status, next actor, waiting-on-user state, next action, plan staleness, "
+            "and read-only Suggested Prompt copy controls. All arguments are optional; manual launches pass {}."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {
+                    "type": "string",
+                    "description": "Optional conversation UUID (automatically injected/verified by PreToolUse hook when called in chat).",
+                },
+                "workspace_path": {
+                    "type": "string",
+                    "description": "Optional workspace path filter.",
+                },
+            },
+        },
+        "_meta": {
+            "ui": {
+                "resourceUri": SIDE_PANEL_URI,
+                "visibility": ["model", "app"],
+            },
+            "com.google.antigravity/ui": {
+                "entrypoints": [
+                    {"type": "aux_pane", "title": "Next Step HUD"},
+                ]
+            },
+        },
+    },
+    {
+        "name": "next_step_panel_state",
+        "title": "Next Step Panel State (App Only)",
+        "description": (
+            "Read-only structured session status query for the Next Step HUD MCP App UI. "
+            "App-only tool; never triggers inference or mutates session state."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "conversation_id": {
+                    "type": "string",
+                    "description": "Optional conversation UUID selected explicitly by the user or bound by the panel.",
+                },
+                "workspace_path": {
+                    "type": "string",
+                    "description": "Optional workspace path filter.",
+                },
+            },
+        },
+        "_meta": {
+            "ui": {
+                "visibility": ["app"],
+            }
+        },
+    },
 ]
+
+
+def _load_side_panel_html() -> str:
+    override = os.environ.get("NEXT_STEP_SIDE_PANEL_HTML", "").strip()
+    path = Path(override).expanduser() if override else SIDE_PANEL_HTML_PATH
+    if not path.is_file():
+        raise FileNotFoundError(f"Side panel UI bundle not found: {path}")
+    html_text = path.read_text(encoding="utf-8")
+    if not html_text.strip():
+        raise ValueError(f"Side panel UI bundle is empty: {path}")
+    if len(html_text.encode("utf-8")) > MAX_UI_RESOURCE_BYTES:
+        raise ValueError(f"Side panel UI bundle exceeds {MAX_UI_RESOURCE_BYTES} bytes: {path}")
+    return html_text
 
 
 def _read_message() -> tuple[dict[str, Any] | None, str]:
@@ -241,10 +334,53 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             "isError": False,
         }
 
+    if name in ("next_step_side_panel", "next_step_panel_state"):
+        sys_cid = str(core.clean_arg(args.get("_sys_conversation_id") or "")).strip() or None
+        explicit_cid = str(core.clean_arg(args.get("conversation_id") or "")).strip() or None
+        ws_path = str(core.clean_arg(args.get("workspace_path") or "")).strip() or None
+
+        if sys_cid:
+            target_cid = sys_cid
+            binding_mode = "hook_bound"
+        elif explicit_cid:
+            target_cid = explicit_cid
+            binding_mode = "explicit"
+        else:
+            target_cid = None
+            binding_mode = "unbound"
+
+        payload = core.build_side_panel_payload(
+            bound_cid=target_cid,
+            binding_mode=binding_mode,
+            workspace_filter=ws_path,
+        )
+        return {
+            "content": [{"type": "text", "text": core.format_side_panel_text(payload)}],
+            "structuredContent": payload,
+            "isError": False,
+        }
+
     return {
         "content": [{"type": "text", "text": f"Unknown tool: {name}"}],
         "isError": True,
     }
+
+
+def _record_host_capabilities(params: dict[str, Any], negotiated_proto: str) -> None:
+    try:
+        caps = params.get("capabilities") if isinstance(params.get("capabilities"), dict) else {}
+        extensions = caps.get("extensions") if isinstance(caps.get("extensions"), dict) else {}
+        record = {
+            "recordedAtIso": core.iso_now(),
+            "protocolVersion": negotiated_proto,
+            "clientProtocolVersion": params.get("protocolVersion"),
+            "clientInfo": params.get("clientInfo"),
+            "capabilities": caps,
+            "extensions": extensions,
+        }
+        core.atomic_write_json(core.DATA_DIR / "mcp_host_capabilities.json", record)
+    except Exception as exc:
+        core.append_error_log("record_host_capabilities", exc)
 
 
 def _dispatch(req: dict[str, Any]) -> dict[str, Any] | None:
@@ -258,12 +394,13 @@ def _dispatch(req: dict[str, Any]) -> dict[str, Any] | None:
     if method == "initialize":
         client_ver = str(params.get("protocolVersion") or "")
         proto = client_ver if client_ver in SUPPORTED_PROTOCOL_VERSIONS else "2024-11-05"
+        _record_host_capabilities(params, proto)
         return {
             "jsonrpc": "2.0",
             "id": req_id,
             "result": {
                 "protocolVersion": proto,
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             },
         }
@@ -275,7 +412,44 @@ def _dispatch(req: dict[str, Any]) -> dict[str, Any] | None:
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": TOOLS}}
 
     if method == "resources/list":
-        return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": []}}
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"resources": RESOURCES}}
+
+    if method == "resources/read":
+        uri = str(params.get("uri") or "").strip() if isinstance(params, dict) else ""
+        if uri != SIDE_PANEL_URI:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32002, "message": f"Resource not found: {uri}"},
+            }
+        try:
+            html_text = _load_side_panel_html()
+        except Exception as exc:
+            core.append_error_log("resources/read:side_panel", exc)
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {"code": -32603, "message": f"Failed to read UI resource: {exc}"},
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "contents": [
+                    {
+                        "uri": SIDE_PANEL_URI,
+                        "mimeType": MCP_APP_MIME_TYPE,
+                        "text": html_text,
+                        "_meta": {
+                            "ui": {
+                                "prefersBorder": False,
+                                "permissions": {"clipboardWrite": {}},
+                            }
+                        },
+                    }
+                ]
+            },
+        }
 
     if method == "prompts/list":
         return {"jsonrpc": "2.0", "id": req_id, "result": {"prompts": []}}

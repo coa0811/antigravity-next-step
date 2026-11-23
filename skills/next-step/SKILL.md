@@ -8,11 +8,13 @@ description: >-
 
 # Next Step HUD Skill
 
-Use the `next-step` MCP tools to inspect or publish the current session's next action status:
+Use the `next-step` MCP tools to inspect, open, or publish the current session's next action status:
 
-1. **Inspect status and open HUD (`next_step_get`)**:
-   - Call `next_step_get` (with `ensure_hud: true`, and `open_window: true` on macOS when the user runs `/next-step` or asks to open/float the HUD window) to query active sessions sorted by `waitingOnUser` and recency, evaluate plan artifact SHA-256 staleness, obtain the local read-only SSE HUD URL (`http://127.0.0.1:<port>/`), and open/surface the native always-on-top non-activating floating HUD panel.
-2. **Publish an explicit next step (`next_step_publish`)**:
+1. **Open the MCP Apps Side Panel (`next_step_side_panel`, primary in Antigravity App)**:
+   - Call `next_step_side_panel` (`{}` — `PreToolUse` binds the active `conversationId` automatically) to open/refresh the native Antigravity Side Panel (`aux_pane`, `ui://next-step/side-panel.html`) beside the conversation. Non-UI clients receive the same clean Markdown summary as plain text.
+2. **Inspect status & open Web/macOS HUD (`next_step_get`)**:
+   - Call `next_step_get` (with `ensure_hud: true`, and `open_window: true` on macOS when the user explicitly asks to open/float the external macOS window) to query active sessions sorted by `waitingOnUser` and recency, evaluate plan artifact SHA-256 staleness, obtain the local read-only SSE HUD URL (`http://127.0.0.1:<port>/`), and open/surface the native always-on-top non-activating floating HUD panel.
+3. **Publish an explicit next step (`next_step_publish`)**:
    - Call `next_step_publish` with `next_action`, `actor` (`"user" | "agent" | "agent_background"`), `waiting_on_user` (`true` or `false`), and optional `suggested_prompt`, `detail`, and `plan_path`.
-3. **Read-only guarantee**:
-   - Present the HUD link, status summary, and any `suggested_prompt` as read-only information. Never auto-execute or auto-submit `suggested_prompt` without the user's explicit command.
+4. **Read-only guarantee**:
+   - Present the Side Panel, HUD link, status summary, and any `suggested_prompt` as read-only information. Never auto-execute or auto-submit `suggested_prompt` without the user's explicit command.

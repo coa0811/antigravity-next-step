@@ -7,6 +7,8 @@ import fcntl
 import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -410,10 +412,14 @@ class NextStepPluginTest(unittest.TestCase):
         )
         self.assertIsNotNone(init_resp)
         self.assertEqual(init_resp["result"]["serverInfo"]["name"], "next-step")
+        self.assertIn("resources", init_resp["result"]["capabilities"])
 
         list_resp = mcp_server._dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         tool_names = {t["name"] for t in list_resp["result"]["tools"]}
-        self.assertEqual(tool_names, {"next_step_publish", "next_step_get"})
+        self.assertEqual(
+            tool_names,
+            {"next_step_publish", "next_step_get", "next_step_side_panel", "next_step_panel_state"},
+        )
 
         cid = "hud-test-session-12345678"
         hook.handle_pre_invocation(self._base_payload(cid, invocationNum=1))
@@ -1562,6 +1568,260 @@ class NextStepPluginTest(unittest.TestCase):
         html_compact = core.render_hud_html(compact=True)
         self.assertIn("cur.planArtifact && cur.planArtifact.stale", html_compact)
         self.assertIn("disabled title=", html_compact)
+
+    def test_mcp_apps_protocol_resource_and_entrypoints(self) -> None:
+        """Verify MCP Apps (SEP-1865 + Antigravity aux_pane) protocol: initialize, tools/_meta, resources/list, resources/read."""
+        init_resp = mcp_server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2026-01-26",
+                    "clientInfo": {"name": "Antigravity Test Host", "version": "2.34.0"},
+                    "capabilities": {
+                        "extensions": {
+                            "io.modelcontextprotocol/ui": {"mimeTypes": ["text/html;profile=mcp-app"]},
+                            "com.google.antigravity/ui": {"entrypoints": ["aux_pane", "global", "file"]},
+                        }
+                    },
+                },
+            }
+        )
+        self.assertIsNotNone(init_resp)
+        res_init = init_resp["result"]
+        self.assertEqual(res_init["protocolVersion"], "2026-01-26")
+        self.assertEqual(res_init["serverInfo"]["version"], "0.3.0")
+        self.assertIn("tools", res_init["capabilities"])
+        self.assertIn("resources", res_init["capabilities"])
+
+        cap_file = self.data_dir / "mcp_host_capabilities.json"
+        self.assertTrue(cap_file.is_file())
+        recorded_caps = json.loads(cap_file.read_text(encoding="utf-8"))
+        self.assertIn("io.modelcontextprotocol/ui", recorded_caps["extensions"])
+
+        list_tools = mcp_server._dispatch({"jsonrpc": "2.0", "id": 11, "method": "tools/list", "params": {}})
+        tools_by_name = {t["name"]: t for t in list_tools["result"]["tools"]}
+
+        sp_tool = tools_by_name["next_step_side_panel"]
+        self.assertEqual(sp_tool["_meta"]["ui"]["resourceUri"], "ui://next-step/side-panel.html")
+        self.assertEqual(sp_tool["_meta"]["ui"]["visibility"], ["model", "app"])
+        entrypoints = sp_tool["_meta"]["com.google.antigravity/ui"]["entrypoints"]
+        self.assertEqual(entrypoints, [{"type": "aux_pane", "title": "Next Step HUD"}])
+        self.assertFalse(any(ep.get("type") == "global" for ep in entrypoints))
+
+        ps_tool = tools_by_name["next_step_panel_state"]
+        self.assertEqual(ps_tool["_meta"]["ui"]["visibility"], ["app"])
+
+        res_list = mcp_server._dispatch({"jsonrpc": "2.0", "id": 12, "method": "resources/list", "params": {}})
+        self.assertEqual(len(res_list["result"]["resources"]), 1)
+        r_meta = res_list["result"]["resources"][0]
+        self.assertEqual(r_meta["uri"], "ui://next-step/side-panel.html")
+        self.assertEqual(r_meta["mimeType"], "text/html;profile=mcp-app")
+
+        res_read = mcp_server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 13,
+                "method": "resources/read",
+                "params": {"uri": "ui://next-step/side-panel.html"},
+            }
+        )
+        content_item = res_read["result"]["contents"][0]
+        self.assertEqual(content_item["uri"], "ui://next-step/side-panel.html")
+        self.assertEqual(content_item["mimeType"], "text/html;profile=mcp-app")
+        self.assertEqual(content_item["_meta"]["ui"]["prefersBorder"], False)
+        html_doc = content_item["text"]
+        self.assertTrue(html_doc.startswith("<!DOCTYPE html>"))
+        self.assertLess(len(html_doc.encode("utf-8")), 10 * 1024 * 1024)
+        self.assertFalse(re.search(r"<script[^>]+src=", html_doc, re.I))
+        self.assertFalse(re.search(r"<link[^>]+href=[\"']https?:", html_doc, re.I))
+        self.assertIn("next_step_panel_state", html_doc)
+
+        missing_read = mcp_server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 14,
+                "method": "resources/read",
+                "params": {"uri": "ui://next-step/missing.html"},
+            }
+        )
+        self.assertEqual(missing_read["error"]["code"], -32002)
+
+    def test_side_panel_session_isolation_unbound_and_stale_enforcement(self) -> None:
+        """Verify strict session isolation: manual {} stays unbound, hooks bind current session, read-only state refresh, and stale blocks copy."""
+        cid_a = "session-side-panel-A"
+        cid_b = "session-side-panel-B"
+        cid_unrecorded = "session-side-panel-NEW"
+        plan_b = self.art_dir / "panel_plan_b.md"
+        plan_b.write_text("# Plan B v1\n", encoding="utf-8")
+
+        # Session A: waiting on ask_question approval
+        hook.handle_pre_invocation(self._base_payload(cid_a, invocationNum=1, lastUserInput="会话A任务"))
+        hook.handle_pre_tool_use(
+            self._base_payload(
+                cid_a,
+                stepIdx=2,
+                lastUserInput="会话A任务",
+                toolCall={
+                    "id": "tc_q_a",
+                    "name": "ask_question",
+                    "args": {"questions": [{"question": "选择方案", "options": ["选项1", "选项2"]}]},
+                },
+            )
+        )
+        hook.handle_stop(self._base_payload(cid_a, lastUserInput="会话A任务", terminationReason="NO_TOOL_CALL", fullyIdle=True))
+
+        # Session B: AGENT_DECLARED with linked plan + suggested prompt
+        hook.handle_pre_invocation(self._base_payload(cid_b, invocationNum=1, lastUserInput="会话B任务"))
+        pub_b = {
+            "next_action": "执行会话 B 的下一步",
+            "actor": "user",
+            "waiting_on_user": True,
+            "suggested_prompt": "继续会话 B",
+            "plan_path": str(plan_b),
+        }
+        pre_b = hook.handle_pre_tool_use(
+            self._base_payload(
+                cid_b,
+                stepIdx=3,
+                lastUserInput="会话B任务",
+                toolCall={"id": "tc_pub_b", "name": "mcp_next-step_next_step_publish", "args": pub_b},
+            )
+        )
+        mcp_server._handle_tool_call("next_step_publish", dict(pub_b, **pre_b["overwrite"], _ensure_hud=False))
+        hook.handle_post_tool_use(
+            self._base_payload(
+                cid_b,
+                stepIdx=3,
+                lastUserInput="会话B任务",
+                toolCall={"id": "tc_pub_b", "name": "mcp_next-step_next_step_publish", "args": pub_b},
+            )
+        )
+        hook.handle_stop(self._base_payload(cid_b, lastUserInput="会话B任务", terminationReason="NO_TOOL_CALL", fullyIdle=True))
+
+        # 1. Manual launch with {} must stay UNBOUND and NEVER guess most recent session
+        manual_res = mcp_server._handle_tool_call("next_step_side_panel", {})
+        self.assertFalse(manual_res["isError"])
+        manual_sc = manual_res["structuredContent"]
+        self.assertEqual(manual_sc["bindingMode"], "unbound")
+        self.assertIsNone(manual_sc["boundConversationId"])
+        self.assertIsNone(manual_sc["selectedSession"])
+        self.assertEqual(len(manual_sc["sessions"]), 2)
+        self.assertIn("未绑定当前会话", manual_res["content"][0]["text"])
+
+        # 2. PreToolUse for next_step_side_panel overrides spoofed cid_b with real cid_a and preserves Session A's APPROVAL_REQUIRED state
+        for tname, tc_args in (
+            ("mcp_next-step_next_step_side_panel", {"conversation_id": cid_b}),
+            ("call_mcp_tool", {"ServerName": "next-step_next_step", "ToolName": "next_step_side_panel", "Arguments": {"conversation_id": cid_b}}),
+        ):
+            pre_panel = hook.handle_pre_tool_use(
+                self._base_payload(cid_a, stepIdx=9, toolCall={"id": "tc_p", "name": tname, "args": tc_args})
+            )
+            self.assertEqual(pre_panel["decision"], "allow")
+            eff_args = pre_panel["overwrite"]["Arguments"] if tname == "call_mcp_tool" else dict(tc_args, **pre_panel["overwrite"])
+            self.assertEqual(eff_args["_sys_conversation_id"], cid_a)
+            hook.handle_post_tool_use(
+                self._base_payload(cid_a, stepIdx=9, toolCall={"id": "tc_p", "name": tname, "args": tc_args})
+            )
+            panel_a_res = mcp_server._handle_tool_call("next_step_side_panel", eff_args)
+            sc_a = panel_a_res["structuredContent"]
+            self.assertEqual(sc_a["bindingMode"], "hook_bound")
+            self.assertEqual(sc_a["boundConversationId"], cid_a)
+            self.assertEqual(sc_a["selectedSession"]["conversationId"], cid_a)
+            self.assertEqual(sc_a["selectedSession"]["sourceType"], "APPROVAL_REQUIRED")
+            self.assertEqual(sc_a["selectedSession"]["options"], ["选项1", "选项2"])
+            self.assertNotIn("继续会话 B", json.dumps(sc_a["selectedSession"], ensure_ascii=False))
+
+        # 3. Unrecorded/new conversation must return sessionNotFound=True without leaking A or B
+        pre_new = hook.handle_pre_tool_use(
+            self._base_payload(cid_unrecorded, stepIdx=1, toolCall={"id": "tc_new", "name": "mcp_next-step_next_step_side_panel", "args": {}})
+        )
+        new_res = mcp_server._handle_tool_call("next_step_side_panel", pre_new["overwrite"])
+        new_sc = new_res["structuredContent"]
+        self.assertEqual(new_sc["bindingMode"], "hook_bound")
+        self.assertTrue(new_sc["sessionNotFound"])
+        self.assertIsNone(new_sc["selectedSession"])
+
+        # 4. App-only state query is strictly read-only and blocks copy when plan file is rewritten
+        session_b_path = core.session_path(cid_b)
+        mtime_before = session_b_path.stat().st_mtime_ns
+        bytes_before = session_b_path.read_bytes()
+
+        state_b_fresh = mcp_server._handle_tool_call("next_step_panel_state", {"conversation_id": cid_b})
+        self.assertEqual(state_b_fresh["structuredContent"]["bindingMode"], "explicit")
+        self.assertFalse(state_b_fresh["structuredContent"]["selectedSession"]["copyBlocked"])
+
+        plan_b.write_text("# Plan B v2 (rewritten)\n", encoding="utf-8")
+        state_b_stale = mcp_server._handle_tool_call("next_step_panel_state", {"conversation_id": cid_b})
+        sc_b_stale = state_b_stale["structuredContent"]
+        self.assertTrue(sc_b_stale["selectedSession"]["stale"])
+        self.assertTrue(sc_b_stale["selectedSession"]["planArtifact"]["stale"])
+        self.assertTrue(sc_b_stale["selectedSession"]["copyBlocked"])
+        self.assertIn("已阻止直接复制", state_b_stale["content"][0]["text"])
+        self.assertNotIn("继续会话 B", state_b_stale["content"][0]["text"])
+
+        # Verify next_step_panel_state never wrote to session_b_path
+        self.assertEqual(session_b_path.stat().st_mtime_ns, mtime_before)
+        self.assertEqual(session_b_path.read_bytes(), bytes_before)
+
+        # 5. Long suggested_prompt (>=4,000 chars) must remain unclipped so tail constraints are never silently lost
+        tail_marker = "TAIL_CONSTRAINT_DO_NOT_DELETE"
+        long_prompt = ("A" * 3999) + tail_marker
+        self.assertEqual(len(long_prompt), 4028)
+        cid_long = "session-side-panel-long"
+        hook.handle_pre_invocation(self._base_payload(cid_long, invocationNum=1, lastUserInput="长提示词测试"))
+        pub_long = {
+            "next_action": "执行长指令校验",
+            "actor": "user",
+            "waiting_on_user": True,
+            "suggested_prompt": long_prompt,
+        }
+        pre_long = hook.handle_pre_tool_use(
+            self._base_payload(
+                cid_long,
+                stepIdx=2,
+                lastUserInput="长提示词测试",
+                toolCall={"id": "tc_pub_long", "name": "mcp_next-step_next_step_publish", "args": pub_long},
+            )
+        )
+        mcp_server._handle_tool_call("next_step_publish", dict(pub_long, **pre_long["overwrite"], _ensure_hud=False))
+        hook.handle_post_tool_use(
+            self._base_payload(
+                cid_long,
+                stepIdx=2,
+                lastUserInput="长提示词测试",
+                toolCall={"id": "tc_pub_long", "name": "mcp_next-step_next_step_publish", "args": pub_long},
+            )
+        )
+        hook.handle_stop(self._base_payload(cid_long, lastUserInput="长提示词测试", terminationReason="NO_TOOL_CALL", fullyIdle=True))
+
+        long_res = mcp_server._handle_tool_call("next_step_panel_state", {"conversation_id": cid_long})
+        long_item = long_res["structuredContent"]["selectedSession"]
+        self.assertFalse(long_item["copyBlocked"])
+        self.assertEqual(long_item["suggestedPrompt"], long_prompt)
+        self.assertTrue(long_item["suggestedPrompt"].endswith(tail_marker))
+
+    def test_side_panel_built_bundle_vm_behavior(self) -> None:
+        """Run the Node VM verification harness against the built single-file ui/side-panel.html."""
+        node_bin = shutil.which("node")
+        if node_bin is None:
+            self.skipTest("node runtime unavailable")
+        script_path = Path(__file__).resolve().parent / "verify_side_panel.mjs"
+        self.assertTrue(script_path.is_file())
+        proc = subprocess.run(
+            [node_bin, str(script_path)],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            msg=f"verify_side_panel.mjs failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
+        )
+        self.assertIn("ALL SIDE PANEL BUNDLE CHECKS PASSED", proc.stdout)
 
 
 if __name__ == "__main__":

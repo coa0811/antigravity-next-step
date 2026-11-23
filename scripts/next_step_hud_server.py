@@ -27,7 +27,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import next_step_core as core  # noqa: E402
 
 DEFAULT_HUD_PORT = 18765
-HUD_SERVER_VERSION = "0.2.2"
+HUD_SERVER_VERSION = "0.3.0"
 
 
 def _compute_sessions_signature() -> tuple[Any, ...]:

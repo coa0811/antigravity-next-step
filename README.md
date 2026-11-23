@@ -17,7 +17,8 @@
      3. `WORKING` / `TOOL_RUNNING` 超过 `120s` 无事件更新时自动标记超时提示。
      4. `Stop` 收到 `USER_CANCELED` 或 `ERROR` 时立即作废本轮暂存声明。
 
-3. **只读展示层（macOS 原生置顶悬浮窗 + 本地 SSE HUD + 静态快照 + CLI `statusLine` 伴随脚本）**
+3. **只读展示层（MCP Apps 原生侧边面板 + macOS 原生置顶悬浮窗 + 本地 SSE HUD + 静态快照 + CLI `statusLine` 伴随脚本）**
+   - **MCP Apps 原生 Side Panel（`aux_pane`）**：由 [next_step_mcp_server.py](scripts/next_step_mcp_server.py) 提供单文件自包含 `ui://next-step/side-panel.html` 资源（`text/html;profile=mcp-app`，基于官方 `@modelcontextprotocol/ext-apps` Bridge，支持宿主明暗主题、CSS 变量与 CSP 默认拒绝策略）；通过 `next_step_side_panel` 工具声明 `com.google.antigravity/ui.entrypoints: [{"type": "aux_pane", "title": "Next Step HUD"}]`，并在面板侧调用 `visibility: ["app"]` 只读查询工具 `next_step_panel_state` 按活动可见状态轻量轮询刷新。手动从 **`+`** / **`Plugins`** 菜单传入 `{}` 打开时严格显示「未绑定会话」列表供手动切换，绝不擅自猜测最近会话；在对话中由 Agent 调用时经 `PreToolUse` 自动绑定当前 `conversationId`；计划过期时强制阻断旧指令复制并提供受限剪贴板降级。
    - **macOS 原生非激活置顶悬浮窗（Always-on-Top Non-Activating `NSPanel`）**：通过 `scripts/floating_hud.swift` + `scripts/next_step_floating.py`（或一键脚本 `./scripts/open_floating_hud.sh`，也可通过 `next_step_get(open_window=True)` 拉起）将精简版 `?mode=compact` 置顶悬浮在 Antigravity 聊天框上方并记住位置/尺寸；点击 **`[复制指令]`** 或待选选项通过 `WKScriptMessageHandler` 直接写入系统剪贴板，**不抢占聊天框焦点**，点完直接 `Cmd+V` 粘贴。MCP 服务启动（`next_step_mcp_server.py`）与 `SessionStart`/`PreInvocation` Hook 会非阻塞自动拉起悬浮窗；手动点 `×` 关闭会写入 `$PLUGIN_DATA/floating_hud_dismissed.json` 防重复弹出，直到 MCP 重启、执行 `/next-step` 或运行 `./scripts/open_floating_hud.sh` 才清除恢复；设置 `NEXT_STEP_NO_AUTO_FLOATING_HUD=1` 可关闭自动拉起。
    - **本地实时 SSE HUD**：`scripts/next_step_hud_server.py` 仅绑定 `127.0.0.1`（默认端口 `18765`，冲突自动分配空闲端口并记录于 `$PLUGIN_DATA/hud_server.json`），支持完整/精简双模式切换、多会话 Tab 切换（`waitingOnUser: true` 自动置顶）与只读 **`[复制指令]`** 按钮。
    - **静态快照兜底**：每次状态变更同步生成 `$PLUGIN_DATA/hud_snapshot.html` 与 `$PLUGIN_DATA/latest_next_step.md`。
@@ -37,6 +38,14 @@ plugins/next-step/
 ├── skills/
 │   └── next-step/
 │       └── SKILL.md
+├── ui/
+│   └── side-panel.html
+├── ui_src/
+│   ├── build.mjs
+│   ├── package.json
+│   ├── package-lock.json
+│   ├── side_panel.css
+│   └── side_panel.ts
 ├── scripts/
 │   ├── floating_hud.swift
 │   ├── next_step_core.py
@@ -48,7 +57,8 @@ plugins/next-step/
 │   ├── run_python.sh
 │   └── statusline.sh
 └── tests/
-    └── test_next_step.py
+    ├── test_next_step.py
+    └── verify_side_panel.mjs
 ```
 
 ## 安装、验证与启用方式
@@ -58,11 +68,14 @@ plugins/next-step/
 git clone https://github.com/coa0811/antigravity-next-step.git
 cd antigravity-next-step
 
-# 1. 运行回归测试（22 项）
+# 0.5 若修改了 ui_src/，重新构建单文件 MCP App UI（仓库已包含预构建的 ui/side-panel.html）
+# npm --prefix ./ui_src install && npm --prefix ./ui_src run build
+
+# 1. 运行回归测试（25 项，含构建产物 Node VM 行为测试）
 ./scripts/run_python.sh -m unittest discover -s ./tests -v
 
 # 2. 校验插件清单与目录结构
-agy plugin validate .
+agy plugin validate . --strict
 
 # 3. 安装或软链到 Antigravity 全局插件目录
 agy plugin install .

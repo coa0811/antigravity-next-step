@@ -98,19 +98,30 @@ def _extract_inline_declaration_from_transcript(steps: list[dict[str, Any]]) -> 
     return None
 
 
-def _is_next_step_publish_call(tname: str, args: dict[str, Any]) -> tuple[bool, bool, dict[str, Any]]:
-    """Return (is_publish, is_via_call_mcp_tool, effective_publish_args)."""
+def _match_mcp_tool_call(tname: str, args: dict[str, Any], target_tool: str) -> tuple[bool, bool, dict[str, Any]]:
+    """Return (matched, is_via_call_mcp_tool, effective_tool_args) for direct or wrapped MCP calls."""
     low = tname.lower()
-    if low == "next_step_publish" or low.endswith("_next_step_publish"):
+    suffix = f"_{target_tool}"
+    if low == target_tool or low.endswith(suffix):
         return True, False, args
     if low == "call_mcp_tool":
         inner_name = str(core.clean_arg(args.get("ToolName") or args.get("tool_name") or "")).strip().lower()
-        if inner_name == "next_step_publish" or inner_name.endswith("_next_step_publish"):
+        if inner_name == target_tool or inner_name.endswith(suffix):
             inner_args = core.clean_arg(args.get("Arguments") or args.get("arguments") or {})
             if isinstance(inner_args, dict):
                 return True, True, inner_args
             return True, True, {}
     return False, False, {}
+
+
+def _is_next_step_publish_call(tname: str, args: dict[str, Any]) -> tuple[bool, bool, dict[str, Any]]:
+    """Return (is_publish, is_via_call_mcp_tool, effective_publish_args)."""
+    return _match_mcp_tool_call(tname, args, "next_step_publish")
+
+
+def _is_next_step_side_panel_call(tname: str, args: dict[str, Any]) -> tuple[bool, bool, dict[str, Any]]:
+    """Return (is_side_panel, is_via_call_mcp_tool, effective_panel_args)."""
+    return _match_mcp_tool_call(tname, args, "next_step_side_panel")
 
 
 def _summarize_tool_call(tname: str, args: dict[str, Any]) -> str:
@@ -319,6 +330,24 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             "overwrite": sys_inject,
         }
 
+    is_panel, is_panel_via_call_mcp, panel_args = _is_next_step_side_panel_call(tname, args)
+    if is_panel:
+        sys_inject_panel = {
+            "_sys_conversation_id": cid,
+            "_sys_workspace_paths": state.get("workspacePaths") or [],
+        }
+        if is_panel_via_call_mcp:
+            return {
+                "decision": "allow",
+                "overwrite": {
+                    "Arguments": dict(panel_args, **sys_inject_panel),
+                },
+            }
+        return {
+            "decision": "allow",
+            "overwrite": sys_inject_panel,
+        }
+
     tool_summary = _summarize_tool_call(tname, args)
     now = time.time()
     state["activeTool"] = {
@@ -394,6 +423,10 @@ def handle_post_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
                 state["pendingDeclaration"] = claimed
                 state["planArtifact"] = claimed.get("planArtifact")
                 core.save_session(cid, state)
+        return {}
+
+    is_panel, _, _ = _is_next_step_side_panel_call(tname, args)
+    if is_panel:
         return {}
 
     if low in core.MUTATING_FILE_TOOLS and not error:
