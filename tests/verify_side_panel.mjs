@@ -64,6 +64,13 @@ class FakeElement {
 
   select() {}
 
+  contains(node) {
+    for (let cur = node; cur; cur = cur.parentNode) {
+      if (cur === this) return true;
+    }
+    return false;
+  }
+
   findAll(pred) {
     const out = [];
     const visit = (node) => {
@@ -208,6 +215,14 @@ const fakeDocument = {
   },
 };
 
+// Controllable selection so tests can simulate "user has text selected inside the panel"
+const fakeSelection = {
+  isCollapsed: true,
+  anchorNode: null,
+  removeAllRanges() {},
+  addRange() {},
+};
+
 let nextTimerId = 1;
 const activeTimers = new Map();
 function fakeSetTimeout(fn, delay) {
@@ -240,7 +255,7 @@ const fakeWindow = {
   setTimeout: fakeSetTimeout,
   clearTimeout: fakeClearTimeout,
   getSelection() {
-    return { removeAllRanges() {}, addRange() {} };
+    return fakeSelection;
   },
   matchMedia() {
     return { matches: false, addEventListener() {}, removeEventListener() {} };
@@ -790,8 +805,8 @@ await flushMicrotasks();
 // Idle session should be collapsed initially inside .ns-session-list behind "展开历史空闲会话 (1)"
 const listCollapsed = findSessionListEl();
 assert.ok(listCollapsed, "Session list container missing");
-assert.ok(listCollapsed.textContent.includes("🔴 待我处理"), "Missing waiting group title");
-assert.ok(listCollapsed.textContent.includes("🟢 运行中 / 待核验"), "Missing active group title");
+assert.ok(listCollapsed.textContent.includes("待我处理 ("), "Missing waiting group title");
+assert.ok(listCollapsed.textContent.includes("运行中 / 待核验 ("), "Missing active group title");
 assert.ok(!listCollapsed.textContent.includes("#cid-idle"), "Idle session should be hidden while collapsed");
 const toggleIdleBtn = findButtonsByText("展开历史空闲会话 (1)")[0];
 assert.ok(toggleIdleBtn, "Expected idle session collapse toggle button");
@@ -1388,5 +1403,159 @@ pendingToolCalls.shift().resolve({
 await flushMicrotasks();
 assert.ok(findSessionListEl().textContent.includes("#cid-fw02"), "Workspace B session must render after coalesced fetch");
 console.log("[PASS] 9. Hook-bound refresh guard, filtered A->B / A->All->B switch & stale discard, & disambiguated label persistence");
+
+// 10. Background polls must not rebuild the DOM when nothing visible changed
+//     (keeps <select> focus / manual-copy text selection intact), but errors render at once.
+function latestPollTimer() {
+  const timers = Array.from(activeTimers.values()).filter((t) => t.delay >= 3000);
+  return timers[timers.length - 1];
+}
+if (findButtonsByText("自动刷新: 关").length) {
+  findButtonsByText("自动刷新: 关")[0].onclick();
+  await flushMicrotasks();
+}
+const containerBefore10 = appRoot.children[0];
+const settledPayload10 = {
+  ...makePayload({
+    bindingMode: "unbound",
+    boundConversationId: null,
+    selectedSession: null,
+    sessions: [idleFooWork],
+  }),
+  workspaceFilter: "/work/foo",
+  workspaceOptions: [{ key: "/work/foo", label: "foo" }],
+};
+const poll10a = latestPollTimer();
+assert.ok(poll10a, "Expected poll timer for passive-render test");
+poll10a.fn();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1);
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "unchanged" }],
+  structuredContent: { ...settledPayload10, generatedAtIso: "2026-11-22T00:09:59Z" },
+});
+await flushMicrotasks();
+assert.equal(appRoot.children[0], containerBefore10, "10 FAIL: unchanged poll rebuilt the DOM");
+
+const poll10b = latestPollTimer();
+assert.ok(poll10b, "Expected follow-up poll timer");
+poll10b.fn();
+await flushMicrotasks();
+pendingToolCalls.shift().resolve({ isError: true, content: [{ type: "text", text: "backend down" }] });
+await flushMicrotasks();
+assert.notEqual(appRoot.children[0], containerBefore10, "10 FAIL: poll error did not re-render");
+assert.ok(renderedText().includes("状态查询失败"), "10 FAIL: poll error banner missing");
+console.log("[PASS] 10. Unchanged polls skip DOM rebuild; poll errors render immediately");
+
+// 11. While text is selected inside the panel, unrelated list changes are deferred,
+//     but a same-session prompt withdrawal (new turn: prompt cleared, stale=false) renders at once.
+function liveRegionText() {
+  const live = docBody.findAll((n) => n.attributes?.get?.("aria-live") === "polite")[0];
+  return live ? live.textContent : "";
+}
+assert.ok(liveRegionText().includes("刷新失败"), "11 FAIL: live region did not announce refresh failure");
+
+const sessE = makeSessionItem("cid-eeee-5555", "Action E", "OLD PLAN PROMPT", { options: ["Option E1"] });
+const otherF = makeSessionItem("cid-ffff-6666", "Action F", "Prompt F");
+const selE = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+if (selE) {
+  selE.value = "";
+  selE.onchange();
+  await flushMicrotasks();
+  while (pendingToolCalls.length) {
+    pendingToolCalls.shift().resolve({ structuredContent: makePayload({ sessions: [sessE] }) });
+    await flushMicrotasks();
+  }
+}
+// Select session E explicitly
+const sessSelE = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "选择 Antigravity 会话",
+)[0];
+sessSelE.value = sessE.conversationId;
+sessSelE.onchange();
+await flushMicrotasks();
+pendingToolCalls.shift().resolve({
+  structuredContent: makePayload({
+    bindingMode: "explicit",
+    boundConversationId: sessE.conversationId,
+    selectedSession: sessE,
+    sessions: [sessE],
+  }),
+});
+await flushMicrotasks();
+assert.equal(findButtonsByText("复制指令").length, 1, "11 setup: expected enabled copy for E");
+assert.ok(liveRegionText().includes("Action E"), "11 FAIL: live region did not announce selected session");
+
+// Simulate the user selecting the prompt text (manual-copy fallback)
+const promptPre = appRoot.findAll((n) => n.tagName === "PRE")[0];
+fakeSelection.isCollapsed = false;
+fakeSelection.anchorNode = promptPre;
+
+// 11a. Unrelated overview change (another session appears) is deferred while selecting
+const containerBefore11 = appRoot.children[0];
+latestPollTimer().fn();
+await flushMicrotasks();
+pendingToolCalls.shift().resolve({
+  structuredContent: makePayload({
+    bindingMode: "explicit",
+    boundConversationId: sessE.conversationId,
+    selectedSession: sessE,
+    sessions: [sessE, otherF],
+  }),
+});
+await flushMicrotasks();
+assert.equal(appRoot.children[0], containerBefore11, "11a FAIL: list-only change rebuilt DOM during text selection");
+
+// 11a'. Clearing the selection flushes the deferred render
+fakeSelection.isCollapsed = true;
+fakeSelection.anchorNode = null;
+dispatchTo(docListeners, "selectionchange");
+await flushMicrotasks();
+assert.notEqual(appRoot.children[0], containerBefore11, "11a' FAIL: deferred render not flushed on selectionchange");
+const optValsAfterFlush = appRoot
+  .findAll((n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "选择 Antigravity 会话")[0]
+  .children.map((o) => o.value);
+assert.ok(optValsAfterFlush.includes(otherF.conversationId), "11a' FAIL: flushed render missing new session F");
+
+// Re-select the (re-rendered) prompt text before the withdrawal poll
+fakeSelection.isCollapsed = false;
+fakeSelection.anchorNode = appRoot.findAll((n) => n.tagName === "PRE")[0];
+const containerBefore11b = appRoot.children[0];
+
+// 11b. Same session, new turn: prompt + options withdrawn, stale stays false -> must render now
+const sessEWorking = {
+  ...sessE,
+  lifecycle: "WORKING",
+  waitingOnUser: false,
+  nextAction: null,
+  suggestedPrompt: null,
+  options: [],
+  statusBadge: "🟢 Agent 运行中 (WORKING)",
+};
+latestPollTimer().fn();
+await flushMicrotasks();
+pendingToolCalls.shift().resolve({
+  structuredContent: makePayload({
+    bindingMode: "explicit",
+    boundConversationId: sessE.conversationId,
+    selectedSession: sessEWorking,
+    sessions: [sessEWorking, otherF],
+  }),
+});
+await flushMicrotasks();
+assert.notEqual(appRoot.children[0], containerBefore11b, "11b FAIL: prompt withdrawal deferred during selection");
+assert.equal(findButtonsByText("复制指令").length, 0, "11b FAIL: withdrawn prompt still copyable");
+assert.equal(findButtonsByText("复制选项").length, 0, "11b FAIL: withdrawn options still copyable");
+assert.ok(!renderedText().includes("OLD PLAN PROMPT"), "11b FAIL: withdrawn prompt still shown");
+
+// 11c. Live region follows the new status once selection is cleared
+fakeSelection.isCollapsed = true;
+fakeSelection.anchorNode = null;
+dispatchTo(docListeners, "selectionchange");
+await flushMicrotasks();
+assert.ok(liveRegionText().includes("Agent 运行中"), "11c FAIL: live region not updated to new status");
+console.log("[PASS] 11. Selection defers list-only changes; prompt withdrawal and live-region updates render immediately");
 
 console.log(`ALL SIDE PANEL BUNDLE CHECKS PASSED (total RPC calls=${recordedToolCalls.length}, maxConcurrent=${maxConcurrentRpc})`);

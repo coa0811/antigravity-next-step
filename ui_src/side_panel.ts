@@ -192,6 +192,203 @@ function recomputeWorkspaceLabels(options: WorkspaceOption[]): WorkspaceOption[]
 
 let pollTimer: number | null = null;
 
+// --- Render throttling: avoid clobbering focus / text selection on background polls ---
+let lastRenderSig: string | null = null;
+let lastCopyGateSig: string | null = null;
+let deferredRender = false;
+let syncLabelEl: HTMLElement | null = null;
+let liveRegionEl: HTMLElement | null = null;
+let lastLiveMessage = "";
+
+/**
+ * Anything that can change what is copyable (or whether copying is allowed) must render
+ * immediately, never be deferred: errors, binding, and the full selected-session content
+ * (prompt / options / questions / plan fingerprint / staleness).
+ */
+function copyGateSignature(): string {
+  return JSON.stringify([
+    state.lastError,
+    state.bindingMode,
+    state.selectedCid,
+    state.payload?.selectedSession ?? null,
+  ]);
+}
+
+function renderSignature(): string {
+  const p = state.payload;
+  const payloadSig = p ? { ...p, generatedAtIso: undefined } : null;
+  return JSON.stringify([
+    payloadSig,
+    state.connected,
+    state.connectError,
+    state.loading,
+    state.inFlight,
+    state.pendingRefreshTrigger,
+    state.autoRefresh,
+    state.pollDelayMs,
+    state.lastError,
+    state.bindingMode,
+    state.hookBoundCid,
+    state.selectedCid,
+    state.backendWorkspaceFilter,
+    state.workspaceFilter,
+    state.knownWorkspaceOptions,
+    state.showIdleSessions,
+    // Coarse minute bucket so relative timestamps ("3 分钟前") stay roughly fresh
+    Math.floor(Date.now() / 60000),
+  ]);
+}
+
+function nodeInsideRoot(node: Node | null | undefined): boolean {
+  if (!node || typeof rootEl.contains !== "function") return false;
+  try {
+    return rootEl.contains(node);
+  } catch {
+    return false;
+  }
+}
+
+function isUserInteracting(): boolean {
+  const active = document.activeElement as HTMLElement | null | undefined;
+  if (active && active.tagName === "SELECT" && nodeInsideRoot(active)) return true;
+  const sel = typeof window.getSelection === "function" ? window.getSelection() : null;
+  if (sel && sel.isCollapsed === false && nodeInsideRoot(sel.anchorNode)) return true;
+  return false;
+}
+
+function updateSyncLabel(): void {
+  if (syncLabelEl) syncLabelEl.textContent = formatSyncLabel();
+}
+
+/**
+ * Render path for background polls: skip the DOM rebuild when nothing visible changed,
+ * and postpone it while the user has a <select> focused or text selected (manual-copy
+ * fallback). Copy-gating changes (errors / staleness) always render immediately.
+ */
+function renderPassive(): void {
+  if (copyGateSignature() !== lastCopyGateSig) {
+    render();
+    return;
+  }
+  if (renderSignature() === lastRenderSig) {
+    updateSyncLabel();
+    return;
+  }
+  if (isUserInteracting()) {
+    deferredRender = true;
+    updateSyncLabel();
+    return;
+  }
+  render();
+}
+
+function flushDeferredRender(): void {
+  if (deferredRender && !isUserInteracting()) {
+    render();
+  }
+}
+
+function announce(message: string): void {
+  if (message === lastLiveMessage) return;
+  lastLiveMessage = message;
+  if (!liveRegionEl) {
+    liveRegionEl = document.createElement("div");
+    liveRegionEl.className = "ns-sr-only";
+    liveRegionEl.setAttribute("role", "status");
+    liveRegionEl.setAttribute("aria-live", "polite");
+    document.body.appendChild(liveRegionEl);
+  }
+  liveRegionEl.textContent = message;
+}
+
+// --- Presentation helpers ---
+type Tone = "waiting" | "running" | "stale" | "idle";
+
+function sessionTone(s: SessionPanelItem): Tone {
+  if (s.stale) return "stale";
+  if (s.waitingOnUser) return "waiting";
+  if (
+    s.lifecycle === "WORKING" ||
+    s.lifecycle === "TOOL_RUNNING" ||
+    s.lifecycle === "BACKGROUND_RUNNING"
+  ) {
+    return "running";
+  }
+  return "idle";
+}
+
+function shortStatusLabel(s: SessionPanelItem): string {
+  if (s.stale) return "可能已过期";
+  if (s.waitingOnUser) {
+    switch (s.lifecycle) {
+      case "WAITING_PLAN_REVIEW":
+        return "等你审阅计划";
+      case "WAITING_USER_DECISION":
+        return "等你回答 / 选择";
+      case "WAITING_USER_APPROVAL":
+        return "等你授权";
+      case "ERROR":
+      case "CANCELED":
+        return "已中止，待介入";
+      default:
+        return "等你确认";
+    }
+  }
+  switch (s.lifecycle) {
+    case "WORKING":
+    case "TOOL_RUNNING":
+      return "Agent 运行中";
+    case "BACKGROUND_RUNNING":
+      return "后台任务运行中";
+    default:
+      return "空闲";
+  }
+}
+
+function statusChip(s: SessionPanelItem): HTMLElement {
+  const chip = el("span", `ns-chip ns-tone-${sessionTone(s)}`);
+  const dot = el("span", "ns-dot");
+  dot.setAttribute("aria-hidden", "true");
+  chip.appendChild(dot);
+  chip.appendChild(el("span", "", shortStatusLabel(s)));
+  if (s.statusBadge) chip.title = s.statusBadge;
+  return chip;
+}
+
+function parseIsoMs(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function formatRelativeTime(iso: string | null | undefined): string {
+  const ms = parseIsoMs(iso);
+  if (ms === null) return iso || "时间未知";
+  const diffSec = Math.round((Date.now() - ms) / 1000);
+  if (diffSec < 0) return "刚刚";
+  if (diffSec < 45) return "刚刚";
+  if (diffSec < 3600) return `${Math.max(1, Math.round(diffSec / 60))} 分钟前`;
+  if (diffSec < 86400) return `${Math.round(diffSec / 3600)} 小时前`;
+  if (diffSec < 86400 * 7) return `${Math.round(diffSec / 86400)} 天前`;
+  const d = new Date(ms);
+  return `${d.getMonth() + 1}月${d.getDate()}日`;
+}
+
+function timeEl(iso: string | null | undefined, className = "ns-time"): HTMLElement {
+  const node = el("span", className, formatRelativeTime(iso));
+  if (iso) node.title = iso;
+  return node;
+}
+
+function formatSyncLabel(): string {
+  const ms = parseIsoMs(state.lastSyncedIso);
+  if (ms === null) return "尚未同步";
+  const d = new Date(ms);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  const t = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return state.autoRefresh ? `已同步 ${t}` : `已同步 ${t} · 自动刷新已暂停`;
+}
+
 function matchesCid(
   candidateCid: string | null | undefined,
   targetCid: string | null | undefined,
@@ -506,7 +703,11 @@ async function refreshFromServer(trigger: RefreshTrigger): Promise<void> {
     if (queued && state.connected && (queued !== "poll" || document.visibilityState === "visible")) {
       void refreshFromServer(queued);
     } else {
-      render();
+      if (trigger === "poll") {
+        renderPassive();
+      } else {
+        render();
+      }
       scheduleNextPoll();
     }
   }
@@ -559,35 +760,43 @@ function renderSessionItemButton(
   const wsLabel =
     wsLabelMap?.get(getSessionWorkspaceKey(s)) || s.workspaceName;
   const top = el("div", "ns-session-top");
-  top.appendChild(
-    el("span", "ns-mono", `#${s.shortId} · ${wsLabel}`),
-  );
-  top.appendChild(el("span", "", s.statusBadge));
+  const idEl = el("span", "ns-session-id ns-ellipsis", `#${s.shortId} · ${wsLabel}`);
+  idEl.title = `#${s.shortId} · ${wsLabel}`;
+  top.appendChild(idEl);
+  top.appendChild(statusChip(s));
   btn.appendChild(top);
 
-  const actionPreview =
-    s.nextAction || "当前无已声明的下一步（空闲）";
   btn.appendChild(
-    el("div", "ns-session-sub", `下一步: ${actionPreview}`),
+    el(
+      "div",
+      s.nextAction ? "ns-session-action" : "ns-session-action ns-action-empty",
+      s.nextAction || "当前无已声明的下一步",
+    ),
   );
 
-  const metaParts: string[] = [];
-  if (s.lastUserInput) metaParts.push(`输入: ${s.lastUserInput}`);
-  if (s.updatedAtIso) metaParts.push(s.updatedAtIso);
-  if (metaParts.length) {
-    btn.appendChild(el("div", "ns-session-sub", metaParts.join(" · ")));
+  const sub = el("div", "ns-session-sub");
+  sub.appendChild(timeEl(s.updatedAtIso));
+  if (s.lastUserInput) {
+    sub.appendChild(el("span", "ns-ellipsis", `输入：${s.lastUserInput}`));
   }
+  btn.appendChild(sub);
   return btn;
 }
 
 function appendSessionGroup(
   wrap: HTMLElement,
   title: string,
+  tone: Tone,
   items: SessionPanelItem[],
   wsLabelMap?: Map<string, string>,
 ): void {
   if (!items.length) return;
-  wrap.appendChild(el("div", "ns-group-title", title));
+  const head = el("div", `ns-group-title ns-tone-${tone}`);
+  const dot = el("span", "ns-dot");
+  dot.setAttribute("aria-hidden", "true");
+  head.appendChild(dot);
+  head.appendChild(el("span", "", title));
+  wrap.appendChild(head);
   for (const s of items) {
     wrap.appendChild(renderSessionItemButton(s, wsLabelMap));
   }
@@ -641,8 +850,8 @@ function renderSessionList(
     }
   }
 
-  appendSessionGroup(wrap, `🔴 待我处理 (${waitingGroup.length})`, waitingGroup, wsLabelMap);
-  appendSessionGroup(wrap, `🟢 运行中 / 待核验 (${activeGroup.length})`, activeGroup, wsLabelMap);
+  appendSessionGroup(wrap, `待我处理 (${waitingGroup.length})`, "waiting", waitingGroup, wsLabelMap);
+  appendSessionGroup(wrap, `运行中 / 待核验 (${activeGroup.length})`, "running", activeGroup, wsLabelMap);
 
   if (idleGroup.length > 0) {
     const toggleBtn = el(
@@ -659,7 +868,7 @@ function renderSessionList(
     };
     wrap.appendChild(toggleBtn);
     if (state.showIdleSessions) {
-      appendSessionGroup(wrap, `⚪ 历史空闲 (${idleGroup.length})`, idleGroup, wsLabelMap);
+      appendSessionGroup(wrap, `历史空闲 (${idleGroup.length})`, "idle", idleGroup, wsLabelMap);
     }
   }
   return wrap;
@@ -673,7 +882,7 @@ function renderOptionRow(
 ): HTMLElement {
   const row = el("div", "ns-opt-item");
   const span = el("span", "ns-opt-text", optText);
-  const copyBtn = el("button", "ns-btn", "复制选项");
+  const copyBtn = el("button", "ns-btn ns-btn-ghost", "复制选项");
   copyBtn.type = "button";
   if (copyBlocked) {
     copyBtn.disabled = true;
@@ -699,25 +908,34 @@ function renderSessionDetail(s: SessionPanelItem): HTMLElement {
       : "ns-card";
   const card = el("div", cardCls);
 
-  const metaRow = el("div", "ns-meta-row");
-  metaRow.appendChild(
-    el("span", "ns-mono", `#${s.shortId} · ${s.workspaceName}`),
-  );
-  metaRow.appendChild(el("span", "ns-mono", s.updatedAtIso || "时间未知"));
-  card.appendChild(metaRow);
-
-  if (s.lastUserInput) {
-    card.appendChild(
-      el("div", "ns-detail-text", `最近输入：${s.lastUserInput}`),
-    );
+  // Hero: answers "waiting on me? / who acts? / what next?" at a glance
+  const hero = el("div", `ns-hero ns-tone-${isStale ? "stale" : sessionTone(s)}`);
+  const heroTop = el("div", "ns-hero-top");
+  heroTop.appendChild(statusChip(isStale ? { ...s, stale: true } : s));
+  const actorText = s.actorLabel && s.actorLabel !== "—" ? s.actorLabel : "";
+  if (actorText) {
+    heroTop.appendChild(el("span", "ns-hero-actor", `执行者：${actorText}`));
   }
+  hero.appendChild(heroTop);
+  hero.appendChild(el("div", "ns-section-label", "下一步"));
+  hero.appendChild(
+    el(
+      "p",
+      s.nextAction ? "ns-action-text" : "ns-action-text ns-action-empty",
+      s.nextAction || "当前无已声明的下一步（回合空闲或尚未发布，不作猜测）",
+    ),
+  );
+  if (s.detail) {
+    hero.appendChild(el("div", "ns-detail-text", `说明：${s.detail}`));
+  }
+  card.appendChild(hero);
 
   if (isStale) {
     card.appendChild(
       el(
         "div",
         "ns-banner ns-banner-warn",
-        `🟡 过期警示：${s.staleReason || s.planArtifact?.staleReason || "关联计划文件已变更，旧续作指令已禁用复制"}`,
+        `过期警示：${s.staleReason || s.planArtifact?.staleReason || "关联计划文件已变更，旧续作指令已禁用复制"}`,
       ),
     );
   } else if (isUnverified) {
@@ -725,71 +943,16 @@ function renderSessionDetail(s: SessionPanelItem): HTMLElement {
       el(
         "div",
         "ns-banner ns-banner-warn",
-        "🟡 新鲜度待核验：最近一次状态刷新失败，无法确认指令是否过期，已暂禁复制。请点击「刷新」恢复后再复制。",
+        "新鲜度待核验：最近一次刷新失败，无法确认指令是否过期，已暂禁复制。请点击「刷新」恢复后再复制。",
       ),
     );
   }
 
   if (s.activeTool?.approvalHint) {
     card.appendChild(
-      el(
-        "div",
-        "ns-banner ns-banner-warn",
-        `🟡 审批提示：${s.activeTool.approvalHint}`,
-      ),
+      el("div", "ns-banner ns-banner-warn", `审批提示：${s.activeTool.approvalHint}`),
     );
   }
-
-  const grid = el("div", "ns-grid");
-
-  const mStatus = el("div", "ns-metric");
-  mStatus.appendChild(el("div", "ns-metric-label", "Agent 状态"));
-  const valCls = isStale
-    ? "ns-metric-val ns-val-stale"
-    : s.waitingOnUser
-      ? "ns-metric-val ns-val-waiting"
-      : s.lifecycle === "WORKING" ||
-          s.lifecycle === "TOOL_RUNNING" ||
-          s.lifecycle === "BACKGROUND_RUNNING"
-        ? "ns-metric-val ns-val-running"
-        : "ns-metric-val";
-  mStatus.appendChild(
-    el("div", valCls, `${s.statusBadge} [${s.lifecycle}]`),
-  );
-  grid.appendChild(mStatus);
-
-  const mWait = el("div", "ns-metric");
-  mWait.appendChild(el("div", "ns-metric-label", "Waiting on User"));
-  mWait.appendChild(
-    el(
-      "div",
-      s.waitingOnUser ? "ns-metric-val ns-val-waiting" : "ns-metric-val",
-      s.waitingOnUser ? "是 · 等待用户确认/操作" : "否 · 无需用户介入",
-    ),
-  );
-  grid.appendChild(mWait);
-
-  const mActor = el("div", "ns-metric");
-  mActor.appendChild(el("div", "ns-metric-label", "下一步执行者"));
-  mActor.appendChild(el("div", "ns-metric-val", s.actorLabel || "未知"));
-  grid.appendChild(mActor);
-
-  card.appendChild(grid);
-
-  const actionBox = el("div", "ns-action-box");
-  actionBox.appendChild(el("div", "ns-section-label", "接下来要做什么 (Next Action)"));
-  actionBox.appendChild(
-    el(
-      "p",
-      "ns-action-text",
-      s.nextAction ||
-        "当前无已声明的下一步（回合空闲或尚未发布，不作猜测）",
-    ),
-  );
-  if (s.detail) {
-    actionBox.appendChild(el("div", "ns-detail-text", `说明：${s.detail}`));
-  }
-  card.appendChild(actionBox);
 
   const qList = s.questions && s.questions.length > 0 ? s.questions : [];
   if (qList.length > 1) {
@@ -798,7 +961,7 @@ function renderSessionDetail(s: SessionPanelItem): HTMLElement {
       el(
         "div",
         "ns-section-label",
-        `待选确认项（系统拦截 · 共 ${qList.length} 个问题）`,
+        `待你选择（共 ${qList.length} 个问题）`,
       ),
     );
     const optHint = el("div", "ns-copy-hint");
@@ -820,7 +983,7 @@ function renderSessionDetail(s: SessionPanelItem): HTMLElement {
       el(
         "div",
         "ns-section-label",
-        `待选确认项（系统拦截 · ${s.options.length} 项）`,
+        `待你选择（${s.options.length} 项）`,
       ),
     );
     const optHint = el("div", "ns-copy-hint");
@@ -843,7 +1006,7 @@ function renderSessionDetail(s: SessionPanelItem): HTMLElement {
           ? "建议续作指令（已过期，已阻止复制）"
           : isUnverified
             ? "建议续作指令（刷新失败，暂禁复制）"
-            : "Suggested Prompt（只读复制，不自动提交）",
+            : "建议续作指令（复制后由你决定是否发送）",
       ),
     );
     const pre = el("pre", "ns-prompt-pre", s.suggestedPrompt);
@@ -885,11 +1048,18 @@ function renderSessionDetail(s: SessionPanelItem): HTMLElement {
   }
 
   const foot = el("div", "ns-foot-meta");
+  if (s.lastUserInput) {
+    foot.appendChild(el("div", "ns-foot-input", `最近输入：${s.lastUserInput}`));
+  }
+  const footTop = el("div", "ns-foot-row");
+  footTop.appendChild(el("span", "ns-ellipsis", `#${s.shortId} · ${s.workspaceName}`));
+  footTop.appendChild(timeEl(s.updatedAtIso));
+  foot.appendChild(footTop);
   foot.appendChild(
     el(
       "div",
       "",
-      `状态来源与可信度：${s.sourceLabel}（${s.confidence || "UNKNOWN"}）`,
+      `来源：${s.sourceLabel}（${s.confidence || "UNKNOWN"}）· 状态码 ${s.lifecycle}`,
     ),
   );
   if (s.planArtifact?.path) {
@@ -918,6 +1088,12 @@ function render(): void {
   const titleRow = el("div", "ns-title-row");
   titleRow.appendChild(el("h1", "ns-title", "Next Step HUD"));
   titleRow.appendChild(el("span", "ns-ver", state.payload?.version ? `v${state.payload.version}` : "v0.4.0"));
+  const waitingCount = state.payload?.waitingCount ?? 0;
+  if (waitingCount > 0) {
+    const badge = el("span", "ns-count-badge", `${waitingCount} 待处理`);
+    badge.title = `${waitingCount} 个会话在等你 / 共 ${state.payload?.totalSessions ?? state.payload?.sessions.length ?? 0} 个`;
+    titleRow.appendChild(badge);
+  }
   header.appendChild(titleRow);
 
   const toolbar = el("div", "ns-toolbar");
@@ -947,6 +1123,11 @@ function render(): void {
       el("div", "ns-banner ns-banner-danger", `MCP Bridge 连接失败: ${state.connectError}`),
     );
     rootEl.appendChild(container);
+    announce("MCP Bridge 连接失败");
+    syncLabelEl = null;
+    lastRenderSig = renderSignature();
+    lastCopyGateSig = copyGateSignature();
+    deferredRender = false;
     return;
   }
 
@@ -1013,15 +1194,15 @@ function render(): void {
 
   if (state.bindingMode === "hook_bound" && state.selectedCid) {
     bindingTop.appendChild(
-      el("span", "ns-bind-pill bound", `🔗 已绑定当前会话 #${state.selectedCid.slice(0, 8)}`),
+      el("span", "ns-bind-pill bound", `已绑定当前会话 #${state.selectedCid.slice(0, 8)}`),
     );
   } else if (state.bindingMode === "user_selected" && state.selectedCid) {
     bindingTop.appendChild(
-      el("span", "ns-bind-pill selected", `👤 已手动选定 #${state.selectedCid.slice(0, 8)}`),
+      el("span", "ns-bind-pill selected", `已手动选定 #${state.selectedCid.slice(0, 8)}`),
     );
   } else {
     bindingTop.appendChild(
-      el("span", "ns-bind-pill unbound", "⚠️ 未绑定会话（需手动选择，绝不猜测）"),
+      el("span", "ns-bind-pill unbound", "未绑定会话"),
     );
   }
 
@@ -1051,8 +1232,8 @@ function render(): void {
       "option",
       "",
       state.bindingMode === "unbound"
-        ? `-- 请显式选择会话（共 ${visibleSessions.length} 个，不自动猜测） --`
-        : `-- 切换查看其他会话（共 ${visibleSessions.length} 个） --`,
+        ? `选择要查看的会话（共 ${visibleSessions.length} 个）`
+        : `切换到其他会话（共 ${visibleSessions.length} 个）`,
     );
     placeholder.value = "";
     select.appendChild(placeholder);
@@ -1134,7 +1315,7 @@ function render(): void {
       el(
         "div",
         "ns-banner ns-banner-info",
-        "当前未收到会话绑定上下文（例如从面板菜单手动打开，或存在同名冲突）。请从下方列表手动点击会话以查看，系统不会擅自猜测最近会话。",
+        "未收到当前会话的绑定信息，请从下方选择要查看的会话。",
       ),
     );
     container.appendChild(renderSessionList(visibleSessions, wsLabelMap));
@@ -1169,15 +1350,32 @@ function render(): void {
   }
 
   const statusLine = el("div", "ns-status-line");
-  statusLine.appendChild(
-    el("span", "", `同步: ${state.lastSyncedIso || "尚未同步"} · 仅活动面板轮询 (${Math.round(state.pollDelayMs / 1000)}s)`),
-  );
-  statusLine.appendChild(
-    el("span", "", `等待用户会话: ${state.payload?.waitingCount ?? 0} / ${state.payload?.totalSessions ?? sessions.length}`),
-  );
+  syncLabelEl = el("span", "", formatSyncLabel());
+  if (state.lastSyncedIso) {
+    syncLabelEl.title = `${state.lastSyncedIso} · 面板可见时每 ${Math.round(state.pollDelayMs / 1000)}s 刷新`;
+  }
+  statusLine.appendChild(syncLabelEl);
   container.appendChild(statusLine);
 
   rootEl.appendChild(container);
+  lastRenderSig = renderSignature();
+  lastCopyGateSig = copyGateSignature();
+  deferredRender = false;
+
+  announce(liveMessage(matchedSelectedSession, waitingCount));
+}
+
+function liveMessage(sel: SessionPanelItem | null, waitingCount: number): string {
+  if (state.loading) return "";
+  if (sel) {
+    const base = `${shortStatusLabel(sel)}${sel.nextAction ? `：${sel.nextAction}` : ""}`;
+    const staleBlocked = Boolean(sel.stale || sel.planArtifact?.stale || sel.copyBlocked);
+    if (state.lastError) return `${base}。最近一次刷新失败，已暂禁复制`;
+    if (staleBlocked) return `${base}。指令已过期，已禁止复制`;
+    return base;
+  }
+  if (state.lastError) return `刷新失败：${state.lastError}`;
+  return waitingCount > 0 ? `${waitingCount} 个会话在等你处理` : "当前没有待处理会话";
 }
 
 // Register handlers BEFORE app.connect() so initial tool input/result/context are never missed
@@ -1227,6 +1425,12 @@ app.ontoolcancelled = (params) => {
 app.onhostcontextchanged = (ctx) => {
   applyHostContext(ctx);
 };
+
+document.addEventListener("focusout", () => {
+  // Let focus settle on the next element before deciding whether the user is done
+  window.setTimeout(flushDeferredRender, 0);
+});
+document.addEventListener("selectionchange", flushDeferredRender);
 
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
