@@ -1,7 +1,7 @@
 # Next Step HUD Publishing Rule (`next-step`)
 
 - **显式发布下一步指令（`next_step_publish`）**：
-  - 当本轮任务结束前仍存在**明确的后续动作、待验证步骤、待确认分支或阶段交接**时，在收尾回复前调用 `next_step_publish`（传入一句话 `next_action`、`actor: "user" | "agent" | "agent_background"`、`waiting_on_user`，以及可选的 `suggested_prompt`、`detail`、`plan_path`）。
+  - 当本轮任务结束前仍存在**明确的后续动作、待验证步骤、待确认分支或阶段交接**时，在收尾回复前调用 `next_step_publish`（传入一句话 `next_action`、`actor: "user" | "agent" | "agent_background"`、`waiting_on_user`，以及可选的 `suggested_prompt`、`detail`、`plan_path`、`conversation_name`）。
   - 若当前步骤关联了计划或任务工件（如 `implementation_plan.md`），传入 `plan_path` 以便 HUD 记录 SHA-256 指纹并在计划被改写时自动标记过期。
 - **不强行编造下一步**：
   - 当任务已彻底完结、无需任何后续动作，或本轮仅为一次性问答时，**不要调用** `next_step_publish`（由 `Stop` Hook 自动落盘为确定性的 `NONE / 当前无已声明的下一步`）；

@@ -35,6 +35,7 @@ interface WorkspaceOption {
 interface SessionPanelItem {
   conversationId: string;
   shortId: string;
+  conversationName?: string | null;
   workspaceName: string;
   workspaceKey?: string;
   workspacePaths?: string[];
@@ -200,6 +201,34 @@ let syncLabelEl: HTMLElement | null = null;
 let liveRegionEl: HTMLElement | null = null;
 let lastLiveMessage = "";
 
+function clipLabel(text: string, maxLen: number): string {
+  const chars = Array.from(text.trim());
+  if (chars.length <= maxLen) return chars.join("");
+  return `${chars.slice(0, Math.max(0, maxLen - 1)).join("")}…`;
+}
+
+function sessionSignatureView(
+  s: SessionPanelItem | null | undefined,
+): SessionPanelItem | null {
+  if (!s) return null;
+  if (!s.activeTool || s.activeTool.elapsedSec === undefined) return s;
+  const { elapsedSec: _ignored, ...restTool } = s.activeTool;
+  return { ...s, activeTool: restTool };
+}
+
+function resolveSelectedSessionName(
+  matchedSelected: SessionPanelItem | null,
+  allSessions: SessionPanelItem[],
+  cid: string | null,
+): string | null {
+  const fromSelected = matchedSelected?.conversationName?.trim();
+  if (fromSelected) return fromSelected;
+  if (!cid) return null;
+  const found = allSessions.find((s) => matchesCid(s.conversationId, cid));
+  const fromList = found?.conversationName?.trim();
+  return fromList || null;
+}
+
 /**
  * Anything that can change what is copyable (or whether copying is allowed) must render
  * immediately, never be deferred: errors, binding, and the full selected-session content
@@ -210,13 +239,19 @@ function copyGateSignature(): string {
     state.lastError,
     state.bindingMode,
     state.selectedCid,
-    state.payload?.selectedSession ?? null,
+    sessionSignatureView(state.payload?.selectedSession),
   ]);
 }
 
 function renderSignature(): string {
   const p = state.payload;
-  const payloadSig = p ? { ...p, generatedAtIso: undefined } : null;
+  const payloadSig = p
+    ? {
+        ...p,
+        generatedAtIso: undefined,
+        selectedSession: sessionSignatureView(p.selectedSession),
+      }
+    : null;
   return JSON.stringify([
     payloadSig,
     state.connected,
@@ -256,8 +291,17 @@ function isUserInteracting(): boolean {
   return false;
 }
 
+function formatSyncTitle(): string {
+  if (!state.lastSyncedIso) return "";
+  return `${state.lastSyncedIso} · 面板可见时每 ${Math.round(state.pollDelayMs / 1000)}s 刷新`;
+}
+
 function updateSyncLabel(): void {
-  if (syncLabelEl) syncLabelEl.textContent = formatSyncLabel();
+  if (!syncLabelEl) return;
+  syncLabelEl.textContent = formatSyncLabel();
+  if (state.lastSyncedIso) {
+    syncLabelEl.title = formatSyncTitle();
+  }
 }
 
 /**
@@ -748,11 +792,13 @@ function renderSessionItemButton(
   s: SessionPanelItem,
   wsLabelMap?: Map<string, string>,
 ): HTMLButtonElement {
-  const cls = s.stale
+  const convName = (s.conversationName || "").trim();
+  const baseCls = s.stale
     ? "ns-session-item stale"
     : s.waitingOnUser
       ? "ns-session-item waiting"
       : "ns-session-item";
+  const cls = convName ? `${baseCls} has-name` : baseCls;
   const btn = el("button", cls);
   btn.type = "button";
   btn.onclick = () => selectSession(s.conversationId);
@@ -760,9 +806,15 @@ function renderSessionItemButton(
   const wsLabel =
     wsLabelMap?.get(getSessionWorkspaceKey(s)) || s.workspaceName;
   const top = el("div", "ns-session-top");
-  const idEl = el("span", "ns-session-id ns-ellipsis", `#${s.shortId} · ${wsLabel}`);
-  idEl.title = `#${s.shortId} · ${wsLabel}`;
-  top.appendChild(idEl);
+  if (convName) {
+    const nameEl = el("span", "ns-session-name ns-ellipsis", convName);
+    nameEl.title = `${convName} · ${wsLabel} (#${s.shortId})`;
+    top.appendChild(nameEl);
+  } else {
+    const idEl = el("span", "ns-session-id ns-ellipsis", `#${s.shortId} · ${wsLabel}`);
+    idEl.title = `#${s.shortId} · ${wsLabel}`;
+    top.appendChild(idEl);
+  }
   top.appendChild(statusChip(s));
   btn.appendChild(top);
 
@@ -776,7 +828,11 @@ function renderSessionItemButton(
 
   const sub = el("div", "ns-session-sub");
   sub.appendChild(timeEl(s.updatedAtIso));
-  if (s.lastUserInput) {
+  if (convName) {
+    const metaEl = el("span", "ns-session-meta ns-ellipsis", `${wsLabel} · #${s.shortId}`);
+    metaEl.title = `${wsLabel} · #${s.shortId}`;
+    sub.appendChild(metaEl);
+  } else if (s.lastUserInput) {
     sub.appendChild(el("span", "ns-ellipsis", `输入：${s.lastUserInput}`));
   }
   btn.appendChild(sub);
@@ -907,6 +963,18 @@ function renderSessionDetail(s: SessionPanelItem): HTMLElement {
       ? "ns-card waiting"
       : "ns-card";
   const card = el("div", cardCls);
+
+  const convName = (s.conversationName || "").trim();
+  if (convName) {
+    const head = el("div", "ns-card-head");
+    const titleEl = el("div", "ns-card-title ns-ellipsis", convName);
+    titleEl.title = `${convName} · ${s.workspaceName} (#${s.shortId})`;
+    head.appendChild(titleEl);
+    const subIdEl = el("span", "ns-card-sub ns-mono", `#${s.shortId}`);
+    subIdEl.title = `会话 ID：${s.conversationId}`;
+    head.appendChild(subIdEl);
+    card.appendChild(head);
+  }
 
   // Hero: answers "waiting on me? / who acts? / what next?" at a glance
   const hero = el("div", `ns-hero ns-tone-${isStale ? "stale" : sessionTone(s)}`);
@@ -1052,7 +1120,7 @@ function renderSessionDetail(s: SessionPanelItem): HTMLElement {
     foot.appendChild(el("div", "ns-foot-input", `最近输入：${s.lastUserInput}`));
   }
   const footTop = el("div", "ns-foot-row");
-  footTop.appendChild(el("span", "ns-ellipsis", `#${s.shortId} · ${s.workspaceName}`));
+  footTop.appendChild(el("span", "ns-ellipsis", `${s.workspaceName} · #${s.shortId}`));
   footTop.appendChild(timeEl(s.updatedAtIso));
   foot.appendChild(footTop);
   foot.appendChild(
@@ -1189,17 +1257,45 @@ function render(): void {
     ? sessions.filter((s) => sessionMatchesWorkspace(s, state.workspaceFilter))
     : sessions;
 
+  const curPayload = state.payload;
+  const matchedNotFound = Boolean(
+    curPayload?.sessionNotFound && matchesCid(curPayload.boundConversationId, state.selectedCid),
+  );
+  const matchedSelectedSession =
+    curPayload?.selectedSession && matchesCid(curPayload.selectedSession.conversationId, state.selectedCid)
+      ? curPayload.selectedSession
+      : null;
+  const activeName = resolveSelectedSessionName(
+    matchedSelectedSession,
+    sessions,
+    state.selectedCid,
+  );
+
   const bindingBar = el("div", "ns-binding-bar");
   const bindingTop = el("div", "ns-binding-top");
 
   if (state.bindingMode === "hook_bound" && state.selectedCid) {
-    bindingTop.appendChild(
-      el("span", "ns-bind-pill bound", `已绑定当前会话 #${state.selectedCid.slice(0, 8)}`),
-    );
+    const shortCid = state.selectedCid.slice(0, 8);
+    if (activeName) {
+      const pill = el("span", "ns-bind-pill bound ns-ellipsis", `已绑定：${clipLabel(activeName, 20)} · #${shortCid}`);
+      pill.title = `已绑定当前会话：${activeName} (#${shortCid})`;
+      bindingTop.appendChild(pill);
+    } else {
+      bindingTop.appendChild(
+        el("span", "ns-bind-pill bound", `已绑定当前会话 #${shortCid}`),
+      );
+    }
   } else if (state.bindingMode === "user_selected" && state.selectedCid) {
-    bindingTop.appendChild(
-      el("span", "ns-bind-pill selected", `已手动选定 #${state.selectedCid.slice(0, 8)}`),
-    );
+    const shortCid = state.selectedCid.slice(0, 8);
+    if (activeName) {
+      const pill = el("span", "ns-bind-pill selected ns-ellipsis", `已选定：${clipLabel(activeName, 20)} · #${shortCid}`);
+      pill.title = `已手动选定：${activeName} (#${shortCid})`;
+      bindingTop.appendChild(pill);
+    } else {
+      bindingTop.appendChild(
+        el("span", "ns-bind-pill selected", `已手动选定 #${shortCid}`),
+      );
+    }
   } else {
     bindingTop.appendChild(
       el("span", "ns-bind-pill unbound", "未绑定会话"),
@@ -1243,7 +1339,10 @@ function render(): void {
       opt.value = s.conversationId;
       const waitTag = s.stale ? "🟡" : s.waitingOnUser ? "🔴" : "⚪";
       const wsLbl = wsLabelMap.get(getSessionWorkspaceKey(s)) || s.workspaceName;
-      opt.textContent = `${waitTag} #${s.shortId} (${wsLbl}) - ${s.nextAction || "空闲"}`;
+      const convName = (s.conversationName || "").trim();
+      opt.textContent = convName
+        ? `${waitTag} ${clipLabel(convName, 44)} · ${wsLbl} (#${s.shortId})`
+        : `${waitTag} #${s.shortId} (${wsLbl}) - ${s.nextAction || "空闲"}`;
       if (state.bindingMode !== "unbound" && s.conversationId === state.selectedCid) {
         opt.selected = true;
       }
@@ -1291,15 +1390,6 @@ function render(): void {
   }
   container.appendChild(bindingBar);
 
-  const curPayload = state.payload;
-  const matchedNotFound = Boolean(
-    curPayload?.sessionNotFound && matchesCid(curPayload.boundConversationId, state.selectedCid),
-  );
-  const matchedSelectedSession =
-    curPayload?.selectedSession && matchesCid(curPayload.selectedSession.conversationId, state.selectedCid)
-      ? curPayload.selectedSession
-      : null;
-
   if (state.loading) {
     container.appendChild(
       el(
@@ -1336,13 +1426,18 @@ function render(): void {
     container.appendChild(renderSessionDetail(matchedSelectedSession));
   } else if (state.selectedCid) {
     const isLoadingCid = state.inFlight || state.pendingRefreshTrigger !== null;
+    const shortCid = state.selectedCid.slice(0, 8);
     container.appendChild(
       el(
         "div",
         isLoadingCid ? "ns-banner ns-banner-info" : "ns-banner ns-banner-warn",
         isLoadingCid
-          ? `正在加载会话 #${state.selectedCid.slice(0, 8)} 的最新状态...`
-          : `尚未获取到会话 #${state.selectedCid.slice(0, 8)} 的状态（已隐藏其他会话内容以防跨会话混淆，请点击「刷新」重试）。`,
+          ? activeName
+            ? `正在加载会话「${clipLabel(activeName, 30)}」(#${shortCid}) 的最新状态...`
+            : `正在加载会话 #${shortCid} 的最新状态...`
+          : activeName
+            ? `尚未获取到会话「${clipLabel(activeName, 30)}」(#${shortCid}) 的状态（已隐藏其他会话内容以防跨会话混淆，请点击「刷新」重试）。`
+            : `尚未获取到会话 #${shortCid} 的状态（已隐藏其他会话内容以防跨会话混淆，请点击「刷新」重试）。`,
       ),
     );
   } else {
@@ -1352,7 +1447,7 @@ function render(): void {
   const statusLine = el("div", "ns-status-line");
   syncLabelEl = el("span", "", formatSyncLabel());
   if (state.lastSyncedIso) {
-    syncLabelEl.title = `${state.lastSyncedIso} · 面板可见时每 ${Math.round(state.pollDelayMs / 1000)}s 刷新`;
+    syncLabelEl.title = formatSyncTitle();
   }
   statusLine.appendChild(syncLabelEl);
   container.appendChild(statusLine);

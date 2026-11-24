@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import tempfile
 import time
 import traceback
@@ -21,6 +22,28 @@ WATCHDOG_TIMEOUT_SEC = 120.0
 TOOL_APPROVAL_HINT_SEC = 8.0
 MAX_SCANNED_SESSIONS = 60
 PLAN_STAT_SETTLE_NS = 2_000_000_000
+MAX_CONVERSATION_NAME_LEN = 80
+TRANSCRIPT_HEAD_MAX_LINES = 25
+TRANSCRIPT_HEAD_MAX_LINE_BYTES = 65536
+MAX_TRANSCRIPT_NAME_CACHE = 128
+MAX_PBTXT_BYTES = 131072
+MAX_ANNOTATION_CACHE = 256
+MAX_SUMMARIES_DB_CACHE = 16
+MAX_SUMMARIES_DB_BYTES = 64 * 1024 * 1024
+MAX_DB_SNAPSHOT_RETRIES = 3
+DB_SNAPSHOT_RETRY_DELAY_SEC = 0.02
+HOST_TITLE_KEYS = ("conversationTitle", "conversationName", "sessionTitle", "title")
+SECTION_TASK_HEADING_RE = re.compile(
+    r"^#{1,4}\s*(?:task|objective|goal|request|\d+\.\s*(?:明确目标|目标|任务))\b",
+    re.IGNORECASE,
+)
+_CONV_NAME_PRIORITY = {"": 0, "derived_fallback": 1, "derived": 2, "explicit": 3, "host": 4}
+_TRANSCRIPT_NAME_CACHE: dict[tuple[str, int, int, int], str | None] = {}
+_ANNOTATION_CACHE: dict[tuple[str, int, int, int], tuple[str | None, dict[str, str]]] = {}
+_SUMMARIES_DB_CACHE: dict[
+    tuple[Any, ...],
+    tuple[dict[str, str], dict[str, str]],
+] = {}
 
 MUTATING_FILE_TOOLS = {
     "write_file",
@@ -50,6 +73,9 @@ ERROR_LOG_PATH = DATA_DIR / "error.log"
 def set_data_dir(new_dir: Path) -> None:
     """Redirect plugin data directory (used by tests and custom environments)."""
     global DATA_DIR, SESSIONS_DIR, PENDING_DIR, LATEST_PENDING_PATH, ERROR_LOG_PATH
+    _TRANSCRIPT_NAME_CACHE.clear()
+    _ANNOTATION_CACHE.clear()
+    _SUMMARIES_DB_CACHE.clear()
     DATA_DIR = Path(new_dir).resolve()
     SESSIONS_DIR = DATA_DIR / "sessions"
     PENDING_DIR = DATA_DIR / "pending"
@@ -102,14 +128,731 @@ def clean_arg(val: Any) -> Any:
     return cur
 
 
-def sanitize_user_input(raw: Any) -> str:
+_WRAPPER_XML_PREFIXES = ("<ADDITIONAL_METADATA>", "<USER_SETTINGS_CHANGE>", "<CONTEXT_SUMMARY>")
+_WRAPPER_XML_TAGS = ("ADDITIONAL_METADATA", "USER_SETTINGS_CHANGE", "CONTEXT_SUMMARY")
+_ENVELOPE_TAG_RE = re.compile(
+    r"<(?P<close>/)?(?P<name>USER_REQUEST|ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|CONTEXT_SUMMARY)>"
+)
+_WRAPPER_TAG_RES: dict[str, re.Pattern[str]] = {
+    tag: re.compile(rf"<(?P<close>/)?{tag}>") for tag in _WRAPPER_XML_TAGS
+}
+
+
+def _strip_wrapper_xml(text: str, *, strip_truncated: bool = False) -> str:
+    """Process outermost envelope blocks left-to-right with depth-balanced wrapper tag skipping."""
+    out: list[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        match = _ENVELOPE_TAG_RE.search(text, pos)
+        if not match:
+            out.append(text[pos:])
+            break
+        if match.start() > pos:
+            out.append(text[pos : match.start()])
+
+        name = match.group("name")
+        if match.group("close"):
+            if name != "USER_REQUEST":
+                out.append(match.group(0))
+            pos = match.end()
+            continue
+
+        if name == "USER_REQUEST":
+            close_idx = text.find("</USER_REQUEST>", match.end())
+            if close_idx >= 0:
+                out.append(text[match.end() : close_idx])
+                pos = close_idx + len("</USER_REQUEST>")
+            else:
+                pos = match.end()
+            continue
+
+        depth = 1
+        closed_end: int | None = None
+        for tm in _WRAPPER_TAG_RES[name].finditer(text, match.end()):
+            if tm.group("close"):
+                depth -= 1
+                if depth == 0:
+                    closed_end = tm.end()
+                    break
+            else:
+                depth += 1
+
+        if closed_end is not None:
+            pos = closed_end
+        elif strip_truncated:
+            pos = n
+            break
+        else:
+            out.append(match.group(0))
+            pos = match.end()
+    return "".join(out)
+
+
+def sanitize_user_input(raw: Any, *, unwrap_xml: bool = True) -> str:
     """Strip wrapper XML tags and collapse whitespace into a concise user prompt summary."""
     text = str(raw or "")
-    text = re.sub(r"<ADDITIONAL_METADATA>.*?</ADDITIONAL_METADATA>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<USER_SETTINGS_CHANGE>.*?</USER_SETTINGS_CHANGE>", "", text, flags=re.DOTALL)
-    text = re.sub(r"</?USER_REQUEST>", "", text)
+    if unwrap_xml:
+        text = _strip_wrapper_xml(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text[:240]
+
+
+def sanitize_conversation_name(raw: Any, max_len: int = MAX_CONVERSATION_NAME_LEN) -> str | None:
+    """Normalize control chars and whitespace into a concise single-line conversation title."""
+    if raw is None:
+        return None
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", str(raw))
+    text = re.sub(r"\s+", " ", text).strip()
+    return _clip_str(text, max_len)
+
+
+def _replace_at_file_mention(match: re.Match[str]) -> str:
+    inner = match.group(1).strip()
+    if "/" in inner or "\\" in inner:
+        cleaned = inner.rstrip("/\\")
+        base = cleaned.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].strip()
+        if base:
+            return f"@{base}"
+    return match.group(0)
+
+
+def _strip_line_markdown_prefix(line: str) -> str:
+    cleaned = re.sub(r"^(?:#{1,6}\s+|>\s+|[-*]\s+)", "", line).strip()
+    if cleaned.startswith("**") and cleaned.endswith("**") and len(cleaned) > 4:
+        cleaned = cleaned[2:-2].strip()
+    return cleaned
+
+
+def derive_conversation_name(
+    raw: Any,
+    max_len: int = MAX_CONVERSATION_NAME_LEN,
+    *,
+    strip_truncated: bool = False,
+    unwrap_xml: bool = True,
+) -> str | None:
+    """Derive a readable conversation title from an initial prompt or structured task block."""
+    if raw is None:
+        return None
+    text = str(raw)
+    if unwrap_xml:
+        text = _strip_wrapper_xml(text, strip_truncated=strip_truncated)
+    text = re.sub(r"@\[([^\]]+)\]", _replace_at_file_mention, text)
+
+    lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.fullmatch(r"[-*=~_\s]{3,}", line):
+            continue
+        lines.append(line)
+
+    if not lines:
+        return None
+
+    candidate: str | None = None
+    for idx, line in enumerate(lines):
+        if SECTION_TASK_HEADING_RE.match(line):
+            for nxt in lines[idx + 1 :]:
+                if not nxt.startswith("#"):
+                    candidate = nxt
+                    break
+            if candidate is not None:
+                break
+
+    if candidate is None:
+        for line in lines:
+            stripped = _strip_line_markdown_prefix(line)
+            if stripped and not re.fullmatch(r"[-*=~_\s]{3,}", stripped):
+                candidate = stripped
+                break
+    else:
+        stripped = _strip_line_markdown_prefix(candidate)
+        if stripped and not re.fullmatch(r"[-*=~_\s]{3,}", stripped):
+            candidate = stripped
+        else:
+            candidate = None
+            for line in lines:
+                fallback_line = _strip_line_markdown_prefix(line)
+                if fallback_line and not re.fullmatch(r"[-*=~_\s]{3,}", fallback_line):
+                    candidate = fallback_line
+                    break
+
+    return sanitize_conversation_name(candidate, max_len=max_len)
+
+
+def extract_first_user_input_from_transcript(transcript_path: str | None) -> str | None:
+    """Read the first explicit USER_INPUT prompt from the head of a known transcript file."""
+    raw_path = str(transcript_path or "").strip()
+    if not raw_path:
+        return None
+    try:
+        p = Path(raw_path).expanduser()
+        if not p.is_file():
+            return None
+        fallback_content: str | None = None
+        with p.open("rb") as fh:
+            for _ in range(TRANSCRIPT_HEAD_MAX_LINES):
+                raw_line = fh.readline(TRANSCRIPT_HEAD_MAX_LINE_BYTES + 1)
+                if not raw_line or len(raw_line) > TRANSCRIPT_HEAD_MAX_LINE_BYTES:
+                    break
+                s = raw_line.decode("utf-8", errors="replace").strip()
+                if not s:
+                    continue
+                try:
+                    obj = json.loads(s)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict) or obj.get("type") != "USER_INPUT":
+                    continue
+                content = obj.get("content")
+                if not isinstance(content, str):
+                    continue
+                truncated_fields = obj.get("truncated_fields")
+                is_content_truncated = (
+                    isinstance(truncated_fields, list) and "content" in truncated_fields
+                )
+                effective_content = _strip_wrapper_xml(
+                    content,
+                    strip_truncated=is_content_truncated,
+                )
+                if not derive_conversation_name(effective_content, unwrap_xml=False):
+                    continue
+                if obj.get("source") == "USER_EXPLICIT":
+                    return effective_content
+                if fallback_content is None:
+                    fallback_content = effective_content
+        return fallback_content
+    except (OSError, RuntimeError):
+        return None
+
+
+def derive_conversation_name_from_transcript(transcript_path: str | None) -> str | None:
+    """Cached, stat-verified read-only derivation of conversation title from transcript head."""
+    raw_path = str(transcript_path or "").strip()
+    if not raw_path:
+        return None
+    try:
+        p = Path(raw_path).expanduser()
+        if not p.is_file():
+            return None
+        st = p.stat()
+    except (OSError, RuntimeError):
+        return None
+
+    cache_key = (str(p), st.st_mtime_ns, st.st_size, st.st_ino)
+    if cache_key in _TRANSCRIPT_NAME_CACHE:
+        return _TRANSCRIPT_NAME_CACHE[cache_key]
+
+    derived = derive_conversation_name(
+        extract_first_user_input_from_transcript(raw_path),
+        unwrap_xml=False,
+    )
+    if len(_TRANSCRIPT_NAME_CACHE) >= MAX_TRANSCRIPT_NAME_CACHE:
+        _TRANSCRIPT_NAME_CACHE.clear()
+    _TRANSCRIPT_NAME_CACHE[cache_key] = derived
+    return derived
+
+
+def _apply_conversation_name(state: dict[str, Any], name: Any, source: str) -> None:
+    clean = sanitize_conversation_name(name)
+    if not clean:
+        return
+    cur_source = str(state.get("conversationNameSource") or "")
+    cur_prio = _CONV_NAME_PRIORITY.get(cur_source, 0)
+    new_prio = _CONV_NAME_PRIORITY.get(source, 0)
+    if (
+        new_prio > cur_prio
+        or (new_prio == cur_prio and source in ("host", "explicit"))
+        or not str(state.get("conversationName") or "").strip()
+    ):
+        state["conversationName"] = clean
+        state["conversationNameSource"] = source
+
+
+def _derive_from_stored_input(raw: Any) -> str | None:
+    s = str(raw or "")
+    if not s.strip():
+        return None
+    is_likely_truncated = len(s) >= 240 or s.lstrip().startswith(_WRAPPER_XML_PREFIXES)
+    return derive_conversation_name(s, strip_truncated=is_likely_truncated)
+
+
+_PBTXT_SIMPLE_ESCAPES: dict[str, int] = {
+    "a": 0x07,
+    "b": 0x08,
+    "f": 0x0C,
+    "n": 0x0A,
+    "r": 0x0D,
+    "t": 0x09,
+    "v": 0x0B,
+    "\\": 0x5C,
+    "'": 0x27,
+    '"': 0x22,
+    "?": 0x3F,
+}
+
+
+def _is_safe_session_id_segment(val: str) -> bool:
+    return (
+        bool(val)
+        and val not in (".", "..")
+        and "/" not in val
+        and "\\" not in val
+        and ".." not in val
+        and "\x00" not in val
+    )
+
+
+def _resolve_session_app_data_dirs(state: dict[str, Any]) -> list[Path]:
+    """Resolve candidate Antigravity appDataDir roots from session paths without leaking host state into tests."""
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add_candidate(d: Path) -> None:
+        try:
+            resolved = d.resolve()
+        except (OSError, RuntimeError):
+            resolved = d
+        if resolved not in seen:
+            seen.add(resolved)
+            candidates.append(d)
+
+    for key in ("artifactDirectoryPath", "transcriptPath"):
+        raw = str(state.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            p = Path(raw).expanduser()
+        except (OSError, RuntimeError):
+            continue
+        for anc in p.parents:
+            if anc.name == "brain":
+                _add_candidate(anc.parent)
+                break
+
+    if DATA_DIR.parent.name == "plugin_data":
+        _add_candidate(DATA_DIR.parent.parent)
+    return candidates
+
+
+def _unescape_pbtxt_string(raw_inner: str) -> str:
+    """Decode protobuf text-format string escapes (including octal UTF-8 sequences and literal UTF-8)."""
+    buf = bytearray()
+    n = len(raw_inner)
+    i = 0
+    while i < n:
+        ch = raw_inner[i]
+        if ch != "\\":
+            buf.extend(ch.encode("utf-8", errors="replace"))
+            i += 1
+            continue
+        if i + 1 >= n:
+            buf.append(0x5C)
+            break
+        esc = raw_inner[i + 1]
+        if "0" <= esc <= "7":
+            j = i + 1
+            while j < n and j < i + 4 and "0" <= raw_inner[j] <= "7":
+                j += 1
+            buf.append(int(raw_inner[i + 1 : j], 8) & 0xFF)
+            i = j
+            continue
+        if esc == "x":
+            j = i + 2
+            while j < n and j < i + 4 and raw_inner[j] in "0123456789abcdefABCDEF":
+                j += 1
+            if j > i + 2:
+                buf.append(int(raw_inner[i + 2 : j], 16))
+                i = j
+                continue
+        if esc in ("u", "U"):
+            width = 4 if esc == "u" else 8
+            hex_part = raw_inner[i + 2 : i + 2 + width]
+            if len(hex_part) == width and all(c in "0123456789abcdefABCDEF" for c in hex_part):
+                cp = int(hex_part, 16)
+                if 0 <= cp <= 0x10FFFF and not (0xD800 <= cp <= 0xDFFF):
+                    buf.extend(chr(cp).encode("utf-8"))
+                else:
+                    buf.extend("\ufffd".encode("utf-8"))
+                i += 2 + width
+                continue
+        simple = _PBTXT_SIMPLE_ESCAPES.get(esc)
+        if simple is not None:
+            buf.append(simple)
+        else:
+            buf.extend(esc.encode("utf-8", errors="replace"))
+        i += 2
+    return buf.decode("utf-8", errors="replace")
+
+
+def _skip_pbtxt_ws_and_comments(text: str, i: int, n: int) -> int:
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+        elif ch == "#":
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl + 1
+        else:
+            break
+    return i
+
+
+def _scan_pbtxt_string_literal(text: str, i: int, n: int) -> tuple[str | None, int]:
+    quote_ch = text[i]
+    i += 1
+    start = i
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i = min(n, i + 2)
+        elif ch == quote_ch:
+            return _unescape_pbtxt_string(text[start:i]), i + 1
+        elif ch in "\r\n":
+            return None, i
+        else:
+            i += 1
+    return None, n
+
+
+def _read_pbtxt_string_literals(text: str, i: int, n: int) -> tuple[str | None, int]:
+    pos = _skip_pbtxt_ws_and_comments(text, i, n)
+    if pos >= n or text[pos] not in ('"', "'"):
+        return None, i
+    parts: list[str] = []
+    while pos < n and text[pos] in ('"', "'"):
+        chunk, next_pos = _scan_pbtxt_string_literal(text, pos, n)
+        if chunk is None:
+            return None, next_pos
+        parts.append(chunk)
+        pos = _skip_pbtxt_ws_and_comments(text, next_pos, n)
+    return "".join(parts), pos
+
+
+def _parse_pbtxt_annotation(text: str) -> tuple[str | None, dict[str, str]]:
+    """Parse top-level `title` and `side_question_titles` map entries from Antigravity .pbtxt annotations."""
+    n = len(text)
+    i = 0
+    depth = 0
+    top_title: str | None = None
+    side_titles: dict[str, str] = {}
+    in_side_entry = False
+    side_key: str | None = None
+    side_val: str | None = None
+
+    while i < n:
+        i = _skip_pbtxt_ws_and_comments(text, i, n)
+        if i >= n:
+            break
+        ch = text[i]
+        if ch in ('"', "'"):
+            _, i = _read_pbtxt_string_literals(text, i, n)
+            continue
+        if ch == "{":
+            depth += 1
+            i += 1
+            continue
+        if ch == "}":
+            if depth == 1 and in_side_entry:
+                if side_key and side_val is not None:
+                    clean_val = sanitize_conversation_name(side_val)
+                    if clean_val:
+                        side_titles[side_key] = clean_val
+                in_side_entry = False
+                side_key = None
+                side_val = None
+            if depth > 0:
+                depth -= 1
+            i += 1
+            continue
+        if ch.isalpha() or ch == "_":
+            ident_start = i
+            while i < n and (text[i].isalnum() or text[i] == "_"):
+                i += 1
+            ident = text[ident_start:i]
+            j = _skip_pbtxt_ws_and_comments(text, i, n)
+            if depth == 0 and ident == "title":
+                if j < n and text[j] == ":":
+                    k = _skip_pbtxt_ws_and_comments(text, j + 1, n)
+                    val, next_i = _read_pbtxt_string_literals(text, k, n)
+                    if val is not None:
+                        clean = sanitize_conversation_name(val)
+                        if clean:
+                            top_title = clean
+                    i = next_i
+                    continue
+                i = j
+                continue
+            if depth == 0 and ident == "side_question_titles":
+                k = j
+                if k < n and text[k] == ":":
+                    k = _skip_pbtxt_ws_and_comments(text, k + 1, n)
+                if k < n and text[k] == "{":
+                    depth = 1
+                    in_side_entry = True
+                    side_key = None
+                    side_val = None
+                    i = k + 1
+                    continue
+                i = j
+                continue
+            if depth == 1 and in_side_entry and ident in ("key", "value"):
+                if j < n and text[j] == ":":
+                    k = _skip_pbtxt_ws_and_comments(text, j + 1, n)
+                    val, next_i = _read_pbtxt_string_literals(text, k, n)
+                    if val is not None:
+                        if ident == "key":
+                            side_key = val.strip()
+                        else:
+                            side_val = val
+                        i = next_i
+                        continue
+                i = j
+                continue
+            i = j
+            continue
+        i += 1
+    return top_title, side_titles
+
+
+def _read_pbtxt_annotation(pb_path: Path) -> tuple[str | None, dict[str, str]]:
+    """Stat-cached, read-only reader for Antigravity annotation .pbtxt files."""
+    try:
+        if not pb_path.is_file():
+            return None, {}
+        st = pb_path.stat()
+    except (OSError, RuntimeError):
+        return None, {}
+
+    cache_key = (str(pb_path), st.st_mtime_ns, st.st_size, st.st_ino)
+    cached = _ANNOTATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        with pb_path.open("rb") as fh:
+            raw = fh.read(MAX_PBTXT_BYTES)
+        parsed = _parse_pbtxt_annotation(raw.decode("utf-8", errors="replace"))
+    except (OSError, RuntimeError):
+        return None, {}
+
+    if len(_ANNOTATION_CACHE) >= MAX_ANNOTATION_CACHE:
+        _ANNOTATION_CACHE.clear()
+    _ANNOTATION_CACHE[cache_key] = parsed
+    return parsed
+
+
+def _snapshot_db_signature(db_path: Path) -> tuple[str, tuple[Any, ...] | None, int]:
+    """Capture a strictly O_RDONLY consistency signature across DB, WAL, journal, and SHM headers."""
+    try:
+        if not db_path.is_file():
+            return "MISSING", None, 0
+    except (OSError, RuntimeError):
+        return "MISSING", None, 0
+
+    try:
+        st = db_path.stat()
+        db_stat = (st.st_mtime_ns, st.st_size, st.st_ino)
+        with db_path.open("rb") as fh:
+            db_hdr = fh.read(100)
+
+        journal_path = Path(f"{db_path}-journal")
+        journal_stat: tuple[int, int, int] | None = None
+        if journal_path.is_file():
+            jst = journal_path.stat()
+            if jst.st_size > 0:
+                return "UNSTABLE", None, 0
+            journal_stat = (jst.st_mtime_ns, jst.st_size, jst.st_ino)
+
+        wal_path = Path(f"{db_path}-wal")
+        wal_stat: tuple[int, int, int] | None = None
+        wal_hdr = b""
+        if wal_path.is_file():
+            wst = wal_path.stat()
+            wal_stat = (wst.st_mtime_ns, wst.st_size, wst.st_ino)
+            if wst.st_size > 0:
+                with wal_path.open("rb") as fh:
+                    wal_hdr = fh.read(32)
+
+        shm_path = Path(f"{db_path}-shm")
+        shm_sig: tuple[bytes, bytes] | None = None
+        if shm_path.is_file():
+            with shm_path.open("rb") as fh:
+                shm_raw = fh.read(100)
+            if len(shm_raw) >= 96 and shm_raw[0:48] != shm_raw[48:96]:
+                return "UNSTABLE", None, 0
+            shm_sig = (shm_raw[0:48], shm_raw[96:100])
+    except FileNotFoundError:
+        return "UNSTABLE", None, 0
+    except (OSError, RuntimeError):
+        return "MISSING", None, 0
+
+    total_bytes = db_stat[1] + (wal_stat[1] if wal_stat else 0)
+    sig = (str(db_path), db_stat, db_hdr, wal_stat, wal_hdr, journal_stat, shm_sig)
+    return "OK", sig, total_bytes
+
+
+def _copy_exact_cap(src: Any, dst: Any, cap_bytes: int, chunk_size: int = 1024 * 1024) -> bool:
+    """Copy at most `cap_bytes` from `src` to `dst`; return False if `src` exceeds `cap_bytes`."""
+    remaining = cap_bytes
+    while remaining > 0:
+        buf = src.read(min(chunk_size, remaining))
+        if not buf:
+            return True
+        dst.write(buf)
+        remaining -= len(buf)
+    return not src.read(1)
+
+
+def _load_summaries_db_maps(db_path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Strictly O_RDONLY snapshot loader for Antigravity conversation_summaries.db with zero host file mutation."""
+    wal_path = Path(f"{db_path}-wal")
+    for attempt in range(MAX_DB_SNAPSHOT_RETRIES):
+        status, before_sig, total_bytes = _snapshot_db_signature(db_path)
+        if status == "MISSING":
+            return {}, {}
+        if status == "UNSTABLE" or before_sig is None:
+            if attempt + 1 < MAX_DB_SNAPSHOT_RETRIES:
+                time.sleep(DB_SNAPSHOT_RETRY_DELAY_SEC)
+                continue
+            return {}, {}
+
+        cached = _SUMMARIES_DB_CACHE.get(before_sig)
+        if cached is not None:
+            return cached
+
+        if total_bytes > MAX_SUMMARIES_DB_BYTES:
+            return {}, {}
+
+        db_expected = int(before_sig[1][1])
+        wal_stat = before_sig[3]
+        wal_expected = int(wal_stat[1]) if wal_stat is not None else 0
+        try:
+            with tempfile.TemporaryDirectory(prefix="next-step-db-") as snap_td:
+                snap_db = Path(snap_td) / "snap.db"
+                snap_wal = Path(snap_td) / "snap.db-wal"
+                copied_ok = False
+                with db_path.open("rb") as src, snap_db.open("wb") as dst:
+                    copied_ok = _copy_exact_cap(src, dst, db_expected)
+                if copied_ok and wal_expected > 0:
+                    with wal_path.open("rb") as src, snap_wal.open("wb") as dst:
+                        copied_ok = _copy_exact_cap(src, dst, wal_expected)
+                if not copied_ok:
+                    if attempt + 1 < MAX_DB_SNAPSHOT_RETRIES:
+                        time.sleep(DB_SNAPSHOT_RETRY_DELAY_SEC)
+                        continue
+                    return {}, {}
+
+                after_status, after_sig, _ = _snapshot_db_signature(db_path)
+                if after_status != "OK" or after_sig != before_sig:
+                    if attempt + 1 < MAX_DB_SNAPSHOT_RETRIES:
+                        time.sleep(DB_SNAPSHOT_RETRY_DELAY_SEC)
+                        continue
+                    return {}, {}
+
+                try:
+                    conn = sqlite3.connect(str(snap_db), timeout=0.5)
+                except sqlite3.Error:
+                    return {}, {}
+
+                titles_map: dict[str, str] = {}
+                parents_map: dict[str, str] = {}
+                transient_err = False
+                try:
+                    try:
+                        conn.execute("PRAGMA query_only = ON")
+                        conn.execute("PRAGMA busy_timeout = 300")
+                    except sqlite3.Error:
+                        pass
+
+                    try:
+                        cur = conn.execute(
+                            "SELECT conversation_id, title FROM conversation_summaries WHERE title IS NOT NULL AND title != ''"
+                        )
+                        for cid_val, title_val in cur:
+                            cid_str = str(cid_val or "").strip()
+                            clean_title = sanitize_conversation_name(title_val)
+                            if cid_str and clean_title:
+                                titles_map[cid_str] = clean_title
+                    except sqlite3.Error as exc:
+                        msg = str(exc).lower()
+                        if "no such table" not in msg and "no such column" not in msg:
+                            transient_err = True
+
+                    try:
+                        cur = conn.execute(
+                            "SELECT conversation_id, parent_id FROM conversation_parents WHERE parent_id IS NOT NULL AND parent_id != ''"
+                        )
+                        for cid_val, parent_val in cur:
+                            cid_str = str(cid_val or "").strip()
+                            parent_str = str(parent_val or "").strip()
+                            if cid_str and parent_str:
+                                parents_map[cid_str] = parent_str
+                    except sqlite3.Error as exc:
+                        msg = str(exc).lower()
+                        if "no such table" not in msg and "no such column" not in msg:
+                            transient_err = True
+                finally:
+                    conn.close()
+
+                if not transient_err:
+                    if len(_SUMMARIES_DB_CACHE) >= MAX_SUMMARIES_DB_CACHE:
+                        _SUMMARIES_DB_CACHE.clear()
+                    _SUMMARIES_DB_CACHE[before_sig] = (titles_map, parents_map)
+                return titles_map, parents_map
+        except (OSError, RuntimeError):
+            if attempt + 1 < MAX_DB_SNAPSHOT_RETRIES:
+                time.sleep(DB_SNAPSHOT_RETRY_DELAY_SEC)
+                continue
+            return {}, {}
+
+    return {}, {}
+
+
+def resolve_antigravity_native_title(state: dict[str, Any]) -> str | None:
+    """Resolve the live Antigravity sidebar title read-only from local annotations/.pbtxt and conversation_summaries.db."""
+    cid = str(state.get("conversationId") or "").strip()
+    if not _is_safe_session_id_segment(cid):
+        return None
+    for app_dir in _resolve_session_app_data_dirs(state):
+        title, _ = _read_pbtxt_annotation(app_dir / "annotations" / f"{cid}.pbtxt")
+        if title:
+            return title
+        titles_map, parents_map = _load_summaries_db_maps(app_dir / "conversation_summaries.db")
+        db_title = titles_map.get(cid)
+        if db_title:
+            return db_title
+        parent_id = parents_map.get(cid)
+        if parent_id and _is_safe_session_id_segment(parent_id):
+            _, side_titles = _read_pbtxt_annotation(app_dir / "annotations" / f"{parent_id}.pbtxt")
+            side_title = side_titles.get(cid)
+            if side_title:
+                return side_title
+    return None
+
+
+def resolve_session_conversation_name(state: dict[str, Any]) -> str | None:
+    """Resolve display title cleanly with read-only Antigravity native title lookup and fallback."""
+    direct = sanitize_conversation_name(state.get("conversationName"))
+    source = str(state.get("conversationNameSource") or "")
+    if direct and source == "host":
+        return direct
+    native = resolve_antigravity_native_title(state)
+    if native:
+        return native
+    if direct and source != "derived_fallback":
+        return direct
+    from_first = _derive_from_stored_input(state.get("firstUserInput"))
+    if from_first:
+        return from_first
+    from_tr = derive_conversation_name_from_transcript(state.get("transcriptPath"))
+    if from_tr:
+        return from_tr
+    if direct:
+        return direct
+    return _derive_from_stored_input(state.get("lastUserInput"))
 
 
 def safe_session_filename(cid: str) -> str:
@@ -243,6 +986,9 @@ def default_session_state(cid: str = "default") -> dict[str, Any]:
     return {
         "conversationId": clean_cid,
         "shortId": clean_cid[:8],
+        "conversationName": "",
+        "conversationNameSource": "",
+        "firstUserInput": "",
         "workspacePaths": [],
         "artifactDirectoryPath": "",
         "transcriptPath": "",
@@ -311,10 +1057,60 @@ def update_common_metadata(state: dict[str, Any], payload: dict[str, Any]) -> No
         state["transcriptPath"] = str(payload["transcriptPath"])
     if payload.get("modelName"):
         state["modelName"] = str(payload["modelName"])
+
+    for key in HOST_TITLE_KEYS:
+        host_val = sanitize_conversation_name(payload.get(key))
+        if host_val:
+            _apply_conversation_name(state, host_val, "host")
+            break
+
+    pre_source = str(state.get("conversationNameSource") or "")
+    has_prior_legacy_fallback = pre_source == "derived_fallback" or (
+        not state.get("firstUserInput")
+        and bool(_derive_from_stored_input(state.get("lastUserInput")))
+    )
+    tried_current_raw_empty = False
     if payload.get("lastUserInput"):
         sanitized = sanitize_user_input(payload["lastUserInput"])
         if sanitized:
             state["lastUserInput"] = sanitized
+        if not state.get("firstUserInput"):
+            tr_first = extract_first_user_input_from_transcript(state.get("transcriptPath"))
+            if tr_first:
+                tr_sanitized = sanitize_user_input(tr_first, unwrap_xml=False)
+                tr_derived = derive_conversation_name(tr_first, unwrap_xml=False)
+                if tr_sanitized and tr_derived:
+                    state["firstUserInput"] = tr_sanitized
+                _apply_conversation_name(state, tr_derived, "derived")
+            elif not has_prior_legacy_fallback:
+                raw_derived = derive_conversation_name(payload["lastUserInput"])
+                if sanitized and raw_derived:
+                    state["firstUserInput"] = sanitized
+                elif raw_derived is None:
+                    tried_current_raw_empty = True
+                _apply_conversation_name(state, raw_derived, "derived")
+
+    cur_source = str(state.get("conversationNameSource") or "")
+    if cur_source not in ("host", "explicit") and (
+        cur_source == "derived_fallback" or not str(state.get("conversationName") or "").strip()
+    ):
+        strong_name = _derive_from_stored_input(state.get("firstUserInput"))
+        if not strong_name and not state.get("firstUserInput"):
+            tr_first_fb = extract_first_user_input_from_transcript(state.get("transcriptPath"))
+            if tr_first_fb:
+                tr_san_fb = sanitize_user_input(tr_first_fb, unwrap_xml=False)
+                tr_der_fb = derive_conversation_name(tr_first_fb, unwrap_xml=False)
+                if tr_san_fb and tr_der_fb:
+                    state["firstUserInput"] = tr_san_fb
+                strong_name = tr_der_fb
+        if not strong_name:
+            strong_name = derive_conversation_name_from_transcript(state.get("transcriptPath"))
+        if strong_name:
+            _apply_conversation_name(state, strong_name, "derived")
+        elif not tried_current_raw_empty and not str(state.get("conversationName") or "").strip():
+            last_fallback = _derive_from_stored_input(state.get("lastUserInput"))
+            if last_fallback:
+                _apply_conversation_name(state, last_fallback, "derived_fallback")
     if payload.get("invocationNum") is not None:
         try:
             state["invocationNum"] = int(payload["invocationNum"])
@@ -435,6 +1231,9 @@ def normalize_declaration(
             artifact_dir=artifact_dir,
         )
 
+    conv_name_raw = clean_arg(args.get("conversation_name") or args.get("conversationName") or "")
+    conversation_name = sanitize_conversation_name(conv_name_raw)
+
     now = time.time()
     return {
         "next_action": next_action,
@@ -443,6 +1242,7 @@ def normalize_declaration(
         "suggested_prompt": suggested_prompt,
         "detail": detail,
         "planArtifact": plan_entry,
+        "conversation_name": conversation_name,
         "stepIdx": int(step_idx or 0),
         "createdAt": now,
         "createdAtIso": iso_now(now),
@@ -456,6 +1256,8 @@ def stage_declaration(
     artifact_dir: str | None = None,
     step_idx: int | None = None,
     write_pending_buffer: bool = True,
+    state: dict[str, Any] | None = None,
+    commit_conversation_name: bool = True,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Stage a normalized next-step declaration into session state and/or pending buffer."""
     ensure_data_dirs()
@@ -482,7 +1284,7 @@ def stage_declaration(
         except (ValueError, TypeError):
             eff_step_idx = 0
 
-    state = load_session(eff_cid) if eff_cid else None
+    state = state if state is not None else (load_session(eff_cid) if eff_cid else None)
     if state is not None:
         if not eff_ws:
             eff_ws = state.get("workspacePaths") or []
@@ -510,6 +1312,8 @@ def stage_declaration(
         atomic_write_json(LATEST_PENDING_PATH, pending_payload)
 
     if state is not None and eff_cid:
+        if commit_conversation_name and decl.get("conversation_name"):
+            _apply_conversation_name(state, decl["conversation_name"], "explicit")
         state["pendingDeclaration"] = decl
         state["sourceType"] = "AGENT_DECLARED"
         state["confidence"] = "HIGH"
@@ -603,6 +1407,8 @@ def promote_plan_review_to_active(state: dict[str, Any], plan_review: dict[str, 
 
 def promote_declaration_to_active(state: dict[str, Any], decl: dict[str, Any], fully_idle: bool = True) -> None:
     """Promote a staged declaration to the session's active AGENT_DECLARED next step."""
+    if decl.get("conversation_name"):
+        _apply_conversation_name(state, decl["conversation_name"], "explicit")
     waiting = bool(decl.get("waiting_on_user", True))
     actor = str(decl.get("actor") or ("user" if waiting else "agent"))
     state["lifecycle"] = "BACKGROUND_RUNNING" if not fully_idle else "IDLE"
@@ -786,6 +1592,7 @@ def _render_session_markdown_block(
     cid: str,
     short_id: str,
     ws_name: str,
+    conversation_name: str | None = None,
     last_input: str | None,
     badge: str,
     actor_label: str,
@@ -802,8 +1609,13 @@ def _render_session_markdown_block(
     suggested_prompt: str | None = None,
     copy_blocked: bool = False,
 ) -> str:
+    heading = (
+        f"### {conversation_name} · `{ws_name}` (`#{short_id}`)"
+        if conversation_name
+        else f"### 会话 `#{short_id}` · `{ws_name}`"
+    )
     lines = [
-        f"### 会话 `#{short_id}` · `{ws_name}`",
+        heading,
         f"- **完整会话 ID**：`{cid}`",
         f"- **最近用户输入**：{last_input or '（尚无用户输入记录）'}",
         f"- **是否在等我**：`{badge}`",
@@ -864,6 +1676,7 @@ def format_session_markdown(state: dict[str, Any]) -> str:
         cid=cid,
         short_id=short_id,
         ws_name=ws_name,
+        conversation_name=resolve_session_conversation_name(ev),
         last_input=ev.get("lastUserInput"),
         badge=format_status_badge(ev),
         actor_label=format_actor_label(ev.get("actor"), bool(ev.get("waitingOnUser"))),
@@ -910,10 +1723,12 @@ def _build_session_common(state: dict[str, Any], now: float | None = None) -> tu
     copy_blocked = bool(is_stale or (isinstance(plan, dict) and plan.get("stale")))
     waiting_on_user = bool(ev.get("waitingOnUser", False))
     actor = str(ev.get("actor") or "none")
+    conv_name = resolve_session_conversation_name(ev)
 
     summary = {
         "conversationId": cid,
         "shortId": short_id,
+        "conversationName": conv_name,
         "workspaceName": ws_name,
         "workspaceKey": ws_key,
         "workspacePaths": ws_list[:4],
@@ -1166,9 +1981,15 @@ def format_side_panel_text(payload: dict[str, Any]) -> str:
         lines = [header.rstrip()]
         for item in sessions[:10]:
             action = item.get("nextAction") or "当前无已声明的下一步"
-            lines.append(
-                f"- `#{item['shortId']}` · `{item['workspaceName']}` · `{item['statusBadge']}` · {action}"
-            )
+            conv_name = str(item.get("conversationName") or "").strip()
+            if conv_name:
+                lines.append(
+                    f"- **{conv_name}** (`#{item['shortId']}` · `{item['workspaceName']}`) · `{item['statusBadge']}` · {action}"
+                )
+            else:
+                lines.append(
+                    f"- `#{item['shortId']}` · `{item['workspaceName']}` · `{item['statusBadge']}` · {action}"
+                )
         return "\n".join(lines)
 
     if payload.get("sessionNotFound"):
@@ -1182,6 +2003,7 @@ def format_side_panel_text(payload: dict[str, Any]) -> str:
             cid=str(sel.get("conversationId") or cid or "default"),
             short_id=str(sel.get("shortId") or str(cid or "default")[:8]),
             ws_name=str(sel.get("workspaceName") or "default-workspace"),
+            conversation_name=sel.get("conversationName"),
             last_input=sel.get("lastUserInput"),
             badge=str(sel.get("statusBadge") or ""),
             actor_label=str(sel.get("actorLabel") or "—"),

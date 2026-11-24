@@ -15,6 +15,6 @@ Use the `next-step` MCP tools to inspect, open, or publish the current session's
 2. **Inspect status as Markdown (`next_step_get`)**:
    - Call `next_step_get` to query active sessions sorted by `waitingOnUser` and recency (or inspect a specific `conversation_id` / `workspace_path`) and check plan artifact SHA-256 staleness in Markdown.
 3. **Publish an explicit next step (`next_step_publish`)**:
-   - Call `next_step_publish` with `next_action`, `actor` (`"user" | "agent" | "agent_background"`), `waiting_on_user` (`true` or `false`), and optional `suggested_prompt`, `detail`, and `plan_path`.
+   - Call `next_step_publish` with `next_action`, `actor` (`"user" | "agent" | "agent_background"`), `waiting_on_user` (`true` or `false`), and optional `suggested_prompt`, `detail`, `plan_path`, and `conversation_name`.
 4. **Read-only guarantee**:
    - Present the Side Panel, HUD link, status summary, and any `suggested_prompt` as read-only information. Never auto-execute or auto-submit `suggested_prompt` without the user's explicit command.

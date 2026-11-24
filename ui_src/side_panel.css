@@ -142,6 +142,7 @@ html, body {
   justify-content: space-between;
   gap: 6px;
   flex-wrap: wrap;
+  min-width: 0;
 }
 
 .ns-bind-pill {
@@ -154,6 +155,12 @@ html, body {
   border-radius: 999px;
   border: 1px solid var(--ns-border);
   background: var(--ns-bg-primary);
+}
+
+.ns-bind-pill.ns-ellipsis {
+  display: inline-block;
+  max-width: 100%;
+  vertical-align: middle;
 }
 
 .ns-bind-pill.bound {
@@ -474,6 +481,26 @@ html, body {
   color: var(--ns-text-secondary);
 }
 
+.ns-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ns-card-title {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--ns-text-primary);
+}
+
+.ns-card-sub {
+  flex: none;
+  font-size: 11px;
+  color: var(--ns-text-tertiary);
+}
+
 .ns-hero .ns-section-label {
   margin-bottom: 0;
 }
@@ -539,6 +566,16 @@ html, body {
   color: var(--ns-text-secondary);
 }
 
+.ns-session-name {
+  font-size: 13px;
+  font-weight: 650;
+  color: var(--ns-text-primary);
+}
+
+.ns-session-meta {
+  color: var(--ns-text-tertiary);
+}
+
 .ns-session-action {
   font-size: 12.5px;
   font-weight: 600;
@@ -547,6 +584,12 @@ html, body {
   -webkit-box-orient: vertical;
   overflow: hidden;
   word-break: break-word;
+}
+
+.ns-session-item.has-name .ns-session-action {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--ns-text-secondary);
 }
 
 .ns-session-sub {

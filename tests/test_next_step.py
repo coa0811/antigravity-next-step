@@ -1899,6 +1899,1262 @@ class NextStepPluginTest(unittest.TestCase):
         self.assertEqual(sec_panel["sessions"], [])
         self.assertEqual(sec_panel["totalSessions"], 0)
 
+    def test_conversation_name_derivation_priority_and_legacy_fallback(self) -> None:
+        """Verify derived/explicit/host title resolution, priority preservation, legacy transcript fallback, and Markdown ordering."""
+        # 1. Derivation helper edge cases
+        long_prompt = "整理" + ("超长标题内容" * 20)
+        clipped = core.derive_conversation_name(long_prompt)
+        self.assertIsNotNone(clipped)
+        self.assertEqual(len(clipped), core.MAX_CONVERSATION_NAME_LEN)
+        self.assertTrue(clipped.endswith("…"))
+
+        at_mention_raw = (
+            "<USER_REQUEST>@[/workspace/configs/service_rules_v1.conf.bak-20261119] "
+            "检查配置</USER_REQUEST><ADDITIONAL_METADATA>ignored</ADDITIONAL_METADATA>"
+        )
+        self.assertEqual(
+            core.derive_conversation_name(at_mention_raw),
+            "@service_rules_v1.conf.bak-20261119 检查配置",
+        )
+
+        structured_task = (
+            "## Recommended execution environment\n"
+            "- **Surface** — Antigravity\n"
+            "---\n"
+            "## Task\n"
+            "### Subheading skipped\n"
+            "开发一个能显示「下一步指令」的插件\n"
+        )
+        self.assertEqual(
+            core.derive_conversation_name(structured_task),
+            "开发一个能显示「下一步指令」的插件",
+        )
+
+        cn_objective = "### 1. 明确目标（Objective）\n同步远端最新提交并对比新旧版本\n"
+        self.assertEqual(
+            core.derive_conversation_name(cn_objective),
+            "同步远端最新提交并对比新旧版本",
+        )
+
+        # 2. Priority hierarchy: derived < explicit < host, and persistence across turns/cancel
+        cid = "conv-title-prio-1234"
+        tr_missing = str(self.art_dir / "nonexistent_tr.jsonl")
+        hook.handle_pre_invocation(
+            self._base_payload(
+                cid,
+                invocationNum=1,
+                transcriptPath=tr_missing,
+                lastUserInput="<USER_REQUEST>第一轮核心任务标题</USER_REQUEST>",
+            )
+        )
+        st1 = core.load_session(cid)
+        self.assertEqual(st1["firstUserInput"], "第一轮核心任务标题")
+        self.assertEqual(st1["conversationName"], "第一轮核心任务标题")
+        self.assertEqual(st1["conversationNameSource"], "derived")
+
+        # Turn 2 changes lastUserInput; derived title from turn 1 must stay stable
+        hook.handle_stop(self._base_payload(cid, terminationReason="NO_TOOL_CALL", fullyIdle=True))
+        hook.handle_pre_invocation(
+            self._base_payload(
+                cid,
+                invocationNum=1,
+                transcriptPath=tr_missing,
+                lastUserInput="第二轮补充问题",
+            )
+        )
+        st2 = core.load_session(cid)
+        self.assertEqual(st2["lastUserInput"], "第二轮补充问题")
+        self.assertEqual(st2["firstUserInput"], "第一轮核心任务标题")
+        self.assertEqual(st2["conversationName"], "第一轮核心任务标题")
+
+        # Explicit conversation_name via next_step_publish upgrades source to explicit
+        pub_explicit = mcp_server._handle_tool_call(
+            "next_step_publish",
+            {
+                "conversation_id": cid,
+                "next_action": "请确认显式标题",
+                "conversation_name": "UI 对比与合并任务",
+            },
+        )
+        self.assertFalse(pub_explicit["isError"])
+        pub_txt = pub_explicit["content"][0]["text"]
+        self.assertIn("UI 对比与合并任务", pub_txt)
+        self.assertLess(pub_txt.index("UI 对比与合并任务"), pub_txt.index(cid[:8]))
+
+        st_exp = core.load_session(cid)
+        self.assertEqual(st_exp["conversationName"], "UI 对比与合并任务")
+        self.assertEqual(st_exp["conversationNameSource"], "explicit")
+
+        # Omitting conversation_name later & USER_CANCELED must preserve explicit title
+        mcp_server._handle_tool_call(
+            "next_step_publish",
+            {"conversation_id": cid, "next_action": "继续检查"},
+        )
+        hook.handle_stop(self._base_payload(cid, terminationReason="USER_CANCELED", fullyIdle=True))
+        hook.handle_pre_invocation(
+            self._base_payload(cid, invocationNum=1, transcriptPath=tr_missing, lastUserInput="第三轮消息")
+        )
+        self.assertEqual(core.load_session(cid)["conversationName"], "UI 对比与合并任务")
+
+        # Host title overrides explicit, and subsequent explicit publish cannot downgrade host
+        hook.handle_pre_invocation(
+            self._base_payload(
+                cid,
+                invocationNum=2,
+                transcriptPath=tr_missing,
+                conversationTitle="宿主官方会话标题",
+            )
+        )
+        st_host = core.load_session(cid)
+        self.assertEqual(st_host["conversationName"], "宿主官方会话标题")
+        self.assertEqual(st_host["conversationNameSource"], "host")
+
+        mcp_server._handle_tool_call(
+            "next_step_publish",
+            {
+                "conversation_id": cid,
+                "next_action": "再次发布",
+                "conversation_name": "试图降级为显式标题",
+            },
+        )
+        st_after = core.load_session(cid)
+        self.assertEqual(st_after["conversationName"], "宿主官方会话标题")
+        self.assertEqual(st_after["conversationNameSource"], "host")
+
+        # Markdown renders conversationName before shortId
+        md = core.format_session_markdown(st_after)
+        self.assertLess(md.index("宿主官方会话标题"), md.index(f"#{st_after['shortId']}"))
+        unbound_payload = core.build_side_panel_payload()
+        unbound_txt = core.format_side_panel_text(unbound_payload)
+        self.assertLess(unbound_txt.index("宿主官方会话标题"), unbound_txt.index(f"#{st_after['shortId']}"))
+
+        # 3. Read-only legacy session fallback via transcript head (no disk mutation) + stat cache invalidation + lastUserInput fallback
+        legacy_cid = "legacy-no-title-9999"
+        legacy_tr = self.art_dir / "legacy_transcript.jsonl"
+        legacy_tr.write_text(
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "<USER_REQUEST>历史第一轮真实课题</USER_REQUEST>"})
+            + "\n",
+            encoding="utf-8",
+        )
+        legacy_file = core.session_path(legacy_cid)
+        legacy_payload = {
+            "conversationId": legacy_cid,
+            "shortId": legacy_cid[:8],
+            "workspacePaths": [str(self.ws_dir)],
+            "transcriptPath": str(legacy_tr),
+            "lastUserInput": "第五十轮随手一句",
+            "lifecycle": "IDLE",
+            "sourceType": "NONE",
+            "waitingOnUser": False,
+            "actor": "none",
+            "updatedAt": time.time(),
+            "updatedAtIso": core.iso_now(),
+        }
+        core.atomic_write_json(legacy_file, legacy_payload)
+        raw_before = legacy_file.read_text(encoding="utf-8")
+
+        panel_legacy = core.build_side_panel_payload(bound_cid=legacy_cid, binding_mode="explicit")
+        self.assertEqual(panel_legacy["selectedSession"]["conversationName"], "历史第一轮真实课题")
+        # Read-only panel query must not rewrite legacy JSON on disk
+        self.assertEqual(legacy_file.read_text(encoding="utf-8"), raw_before)
+
+        # Updating transcript on disk invalidates _TRANSCRIPT_NAME_CACHE cleanly
+        time.sleep(0.01)
+        legacy_tr.write_text(
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "历史第一轮更新后课题"})
+            + "\n",
+            encoding="utf-8",
+        )
+        panel_legacy_2 = core.build_side_panel_payload(bound_cid=legacy_cid, binding_mode="explicit")
+        self.assertEqual(panel_legacy_2["selectedSession"]["conversationName"], "历史第一轮更新后课题")
+
+        # If transcript disappears, legacy state falls back to lastUserInput
+        legacy_tr.unlink()
+        panel_legacy_fallback = core.build_side_panel_payload(bound_cid=legacy_cid, binding_mode="explicit")
+        self.assertEqual(panel_legacy_fallback["selectedSession"]["conversationName"], "第五十轮随手一句")
+
+        # 4. Regression checks from Codex Astra audit (host>explicit across hook->MCP, failed publish preserves name, >240c CONTEXT_SUMMARY, ~missinguser expanduser)
+        # 4a. Host title arriving for the first time in PreToolUse alongside explicit conversation_name must win across PreToolUse -> MCP -> PostToolUse
+        cid_race = "conv-host-race-5555"
+        pub_race_args = {
+            "next_action": "验证宿主优先权",
+            "conversation_name": "显式冲突标题",
+        }
+        pre_race = hook.handle_pre_tool_use(
+            self._base_payload(
+                cid_race,
+                stepIdx=1,
+                transcriptPath=tr_missing,
+                lastUserInput="",
+                conversationTitle="宿主发布标题",
+                toolCall={"id": "tc_r1", "name": "mcp_next-step_next_step_publish", "args": pub_race_args},
+            )
+        )
+        mcp_race_res = mcp_server._handle_tool_call(
+            "next_step_publish",
+            dict(pub_race_args, **pre_race["overwrite"]),
+        )
+        self.assertFalse(mcp_race_res["isError"])
+        self.assertIn("宿主发布标题 · `#conv-hos`", mcp_race_res["content"][0]["text"])
+        hook.handle_post_tool_use(
+            self._base_payload(
+                cid_race,
+                stepIdx=1,
+                transcriptPath=tr_missing,
+                lastUserInput="",
+                toolCall={"id": "tc_r1", "name": "mcp_next-step_next_step_publish", "args": pub_race_args},
+            )
+        )
+        st_race = core.load_session(cid_race)
+        self.assertEqual(st_race["conversationName"], "宿主发布标题")
+        self.assertEqual(st_race["conversationNameSource"], "host")
+
+        # 4b. Failed publish (PreToolUse -> PostToolUse error -> Stop ERROR) must NOT overwrite existing explicit title
+        cid_fail = "conv-pub-fail-6666"
+        hook.handle_pre_invocation(self._base_payload(cid_fail, invocationNum=1, transcriptPath=tr_missing, lastUserInput="初始输入"))
+        mcp_server._handle_tool_call(
+            "next_step_publish",
+            {"conversation_id": cid_fail, "next_action": "初版", "conversation_name": "稳固原名"},
+        )
+        fail_args = {"next_action": "失败发布", "conversation_name": "失败的新标题"}
+        hook.handle_pre_tool_use(
+            self._base_payload(
+                cid_fail,
+                stepIdx=5,
+                transcriptPath=tr_missing,
+                toolCall={"id": "tc_f1", "name": "mcp_next-step_next_step_publish", "args": fail_args},
+            )
+        )
+        hook.handle_post_tool_use(
+            self._base_payload(
+                cid_fail,
+                stepIdx=5,
+                transcriptPath=tr_missing,
+                error="permission denied",
+                toolCall={"id": "tc_f1", "name": "mcp_next-step_next_step_publish", "args": fail_args},
+            )
+        )
+        hook.handle_stop(self._base_payload(cid_fail, transcriptPath=tr_missing, terminationReason="ERROR", error="permission denied"))
+        st_fail = core.load_session(cid_fail)
+        self.assertEqual(st_fail["conversationName"], "稳固原名")
+        self.assertIsNone(st_fail["pendingDeclaration"])
+
+        # 4c. First input consisting purely of a >240-char <CONTEXT_SUMMARY> block must not freeze garbage firstUserInput/title
+        cid_ctx = "conv-ctx-summary-7777"
+        long_ctx = "<CONTEXT_SUMMARY>" + ("摘要正文" * 80) + "</CONTEXT_SUMMARY>"
+        hook.handle_pre_invocation(
+            self._base_payload(cid_ctx, invocationNum=1, transcriptPath=tr_missing, lastUserInput=long_ctx)
+        )
+        st_ctx1 = core.load_session(cid_ctx)
+        self.assertEqual(st_ctx1["firstUserInput"], "")
+        self.assertEqual(st_ctx1["conversationName"], "")
+        hook.handle_stop(self._base_payload(cid_ctx, transcriptPath=tr_missing, lastUserInput=long_ctx, terminationReason="NO_TOOL_CALL", fullyIdle=True))
+        hook.handle_pre_invocation(
+            self._base_payload(cid_ctx, invocationNum=1, transcriptPath=tr_missing, lastUserInput="下一轮真实任务请求")
+        )
+        st_ctx2 = core.load_session(cid_ctx)
+        self.assertEqual(st_ctx2["firstUserInput"], "下一轮真实任务请求")
+        self.assertEqual(st_ctx2["conversationName"], "下一轮真实任务请求")
+
+        # 4d. Unresolvable ~deleteduser transcriptPath must not raise RuntimeError and must fall back cleanly to lastUserInput
+        cid_tilde = "conv-tilde-user-8888"
+        core.atomic_write_json(
+            core.session_path(cid_tilde),
+            {
+                "conversationId": cid_tilde,
+                "shortId": cid_tilde[:8],
+                "workspacePaths": [str(self.ws_dir)],
+                "transcriptPath": "~nonexistent_user_xyz_999/transcript.jsonl",
+                "lastUserInput": "tilde 回退标题",
+                "lifecycle": "IDLE",
+                "sourceType": "NONE",
+                "waitingOnUser": False,
+                "actor": "none",
+                "updatedAt": time.time(),
+                "updatedAtIso": core.iso_now(),
+            },
+        )
+        panel_tilde = core.build_side_panel_payload(bound_cid=cid_tilde, binding_mode="explicit")
+        self.assertEqual(panel_tilde["selectedSession"]["conversationName"], "tilde 回退标题")
+
+        # 5. Round 2 Astra regressions (4e..4h)
+        # 5a. Explicit conversation_id when host omits conversationId in PreToolUse must not commit name on failed publish
+        cid_nohost = "conv-nohost-exp-9001"
+        hook.handle_pre_invocation(self._base_payload(cid_nohost, invocationNum=1, transcriptPath=tr_missing, lastUserInput="初始会话"))
+        mcp_server._handle_tool_call(
+            "next_step_publish",
+            {"conversation_id": cid_nohost, "next_action": "已确立", "conversation_name": "稳固显式标题"},
+        )
+        exp_fail_args = {
+            "conversation_id": cid_nohost,
+            "next_action": "将被拒绝的新发布",
+            "conversation_name": "不应生效的失败标题",
+        }
+        hook.handle_pre_tool_use(
+            {
+                "stepIdx": 7,
+                "toolCall": {"id": "tc_nh_f", "name": "mcp_next-step_next_step_publish", "args": exp_fail_args},
+            }
+        )
+        self.assertEqual(core.load_session(cid_nohost)["conversationName"], "稳固显式标题")
+        hook.handle_post_tool_use(
+            {
+                "stepIdx": 7,
+                "error": "permission denied",
+                "toolCall": {"id": "tc_nh_f", "name": "mcp_next-step_next_step_publish", "args": exp_fail_args},
+            }
+        )
+        self.assertEqual(core.load_session(cid_nohost)["conversationName"], "稳固显式标题")
+        # Succeeding explicit-ID publish commits the new name
+        hook.handle_pre_tool_use(
+            {
+                "stepIdx": 8,
+                "toolCall": {"id": "tc_nh_ok", "name": "mcp_next-step_next_step_publish", "args": {"conversation_id": cid_nohost, "next_action": "成功发布", "conversation_name": "成功后新标题"}},
+            }
+        )
+        hook.handle_post_tool_use(
+            {
+                "stepIdx": 8,
+                "toolCall": {"id": "tc_nh_ok", "name": "mcp_next-step_next_step_publish", "args": {"conversation_id": cid_nohost, "next_action": "成功发布", "conversation_name": "成功后新标题"}},
+            }
+        )
+        self.assertEqual(core.load_session(cid_nohost)["conversationName"], "成功后新标题")
+
+        # 5b. Baseline session JSON whose lastUserInput was 240-char clipped mid <CONTEXT_SUMMARY> returns None instead of leaked tag text
+        cid_old_trunc = "conv-old-trunc-9002"
+        core.atomic_write_json(
+            core.session_path(cid_old_trunc),
+            {
+                "conversationId": cid_old_trunc,
+                "shortId": cid_old_trunc[:8],
+                "workspacePaths": [str(self.ws_dir)],
+                "transcriptPath": tr_missing,
+                "lastUserInput": "<CONTEXT_SUMMARY>" + ("旧截断摘要" * 44),
+                "lifecycle": "IDLE",
+                "sourceType": "NONE",
+                "waitingOnUser": False,
+                "actor": "none",
+                "updatedAt": time.time(),
+                "updatedAtIso": core.iso_now(),
+            },
+        )
+        panel_old_trunc = core.build_side_panel_payload(bound_cid=cid_old_trunc, binding_mode="explicit")
+        self.assertIsNone(panel_old_trunc["selectedSession"]["conversationName"])
+
+        # 5c. Transcript with step 0 summary-only USER_EXPLICIT skips to step 1 real request even when lastUserInput is "继续"
+        cid_tr_skip = "conv-tr-skip-9003"
+        tr_skip = self.art_dir / "skip_summary_tr.jsonl"
+        tr_skip.write_text(
+            "\n".join(
+                [
+                    json.dumps({"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "<CONTEXT_SUMMARY>仅摘要</CONTEXT_SUMMARY>"}),
+                    json.dumps({"step_index": 1, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "<USER_REQUEST>真正的首轮实际课题</USER_REQUEST>"}),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        core.atomic_write_json(
+            core.session_path(cid_tr_skip),
+            {
+                "conversationId": cid_tr_skip,
+                "shortId": cid_tr_skip[:8],
+                "workspacePaths": [str(self.ws_dir)],
+                "transcriptPath": str(tr_skip),
+                "lastUserInput": "继续",
+                "lifecycle": "IDLE",
+                "sourceType": "NONE",
+                "waitingOnUser": False,
+                "actor": "none",
+                "updatedAt": time.time(),
+                "updatedAtIso": core.iso_now(),
+            },
+        )
+        panel_tr_skip = core.build_side_panel_payload(bound_cid=cid_tr_skip, binding_mode="explicit")
+        self.assertEqual(panel_tr_skip["selectedSession"]["conversationName"], "真正的首轮实际课题")
+
+        # 5d. Multi-line divider "---\n***" must derive None (never "--- ***") so next turn sets real title
+        cid_div = "conv-divider-9004"
+        hook.handle_pre_invocation(self._base_payload(cid_div, invocationNum=1, transcriptPath=tr_missing, lastUserInput="---\n***"))
+        hook.handle_stop(self._base_payload(cid_div, transcriptPath=tr_missing, lastUserInput="", terminationReason="NO_TOOL_CALL", fullyIdle=True))
+        st_div1 = core.load_session(cid_div)
+        self.assertEqual(st_div1["firstUserInput"], "")
+        self.assertEqual(st_div1["conversationName"], "")
+        hook.handle_pre_invocation(self._base_payload(cid_div, invocationNum=1, transcriptPath=tr_missing, lastUserInput="分隔线后的真实任务"))
+        st_div2 = core.load_session(cid_div)
+        self.assertEqual(st_div2["firstUserInput"], "分隔线后的真实任务")
+        self.assertEqual(st_div2["conversationName"], "分隔线后的真实任务")
+
+        # 5e. Round 3 regression: literal "<CONTEXT_SUMMARY>" mention in user prompt must NOT be truncated (turns stay distinct and clear pendingDeclaration)
+        cid_lit = "conv-literal-tag-9005"
+        hook.handle_pre_invocation(
+            self._base_payload(
+                cid_lit,
+                invocationNum=1,
+                transcriptPath=tr_missing,
+                lastUserInput="<USER_REQUEST>检查 <CONTEXT_SUMMARY> 的解析规则</USER_REQUEST>",
+            )
+        )
+        mcp_server._handle_tool_call(
+            "next_step_publish",
+            {"conversation_id": cid_lit, "next_action": "旧声明应被下一轮清除"},
+        )
+        st_lit1 = core.load_session(cid_lit)
+        self.assertEqual(st_lit1["lastUserInput"], "检查 <CONTEXT_SUMMARY> 的解析规则")
+        self.assertEqual(st_lit1["conversationName"], "检查 <CONTEXT_SUMMARY> 的解析规则")
+        self.assertIsNotNone(st_lit1["pendingDeclaration"])
+
+        hook.handle_pre_invocation(
+            self._base_payload(
+                cid_lit,
+                invocationNum=2,
+                transcriptPath=tr_missing,
+                lastUserInput="<USER_REQUEST>检查 <CONTEXT_SUMMARY> 的显示样式</USER_REQUEST>",
+            )
+        )
+        st_lit2 = core.load_session(cid_lit)
+        self.assertEqual(st_lit2["lastUserInput"], "检查 <CONTEXT_SUMMARY> 的显示样式")
+        self.assertEqual(st_lit2["conversationName"], "检查 <CONTEXT_SUMMARY> 的解析规则")
+        self.assertIsNone(st_lit2["pendingDeclaration"])
+
+        # 5f. Round 4 regression: literal <CONTEXT_SUMMARY> inside <USER_REQUEST> alongside trailing host <CONTEXT_SUMMARY>...</CONTEXT_SUMMARY>
+        cid_both = "conv-inner-outer-9006"
+        hook.handle_pre_invocation(
+            self._base_payload(
+                cid_both,
+                invocationNum=1,
+                transcriptPath=tr_missing,
+                lastUserInput="<USER_REQUEST>检查 <CONTEXT_SUMMARY> 的解析规则</USER_REQUEST><CONTEXT_SUMMARY>宿主摘要</CONTEXT_SUMMARY>",
+            )
+        )
+        mcp_server._handle_tool_call(
+            "next_step_publish",
+            {"conversation_id": cid_both, "next_action": "第二轮应清除该声明"},
+        )
+        st_b1 = core.load_session(cid_both)
+        self.assertEqual(st_b1["lastUserInput"], "检查 <CONTEXT_SUMMARY> 的解析规则")
+        self.assertEqual(st_b1["conversationName"], "检查 <CONTEXT_SUMMARY> 的解析规则")
+        self.assertIsNotNone(st_b1["pendingDeclaration"])
+
+        hook.handle_pre_invocation(
+            self._base_payload(
+                cid_both,
+                invocationNum=2,
+                transcriptPath=tr_missing,
+                lastUserInput="<USER_REQUEST>检查 <CONTEXT_SUMMARY> 的显示样式</USER_REQUEST><CONTEXT_SUMMARY>宿主摘要</CONTEXT_SUMMARY>",
+            )
+        )
+        st_b2 = core.load_session(cid_both)
+        self.assertEqual(st_b2["lastUserInput"], "检查 <CONTEXT_SUMMARY> 的显示样式")
+        self.assertEqual(st_b2["conversationName"], "检查 <CONTEXT_SUMMARY> 的解析规则")
+        self.assertIsNone(st_b2["pendingDeclaration"])
+
+        # 5g. Round 5 regression: <CONTEXT_SUMMARY> enclosing an old <USER_REQUEST>...</USER_REQUEST> must skip the summary cleanly
+        nested_sum_only = "<CONTEXT_SUMMARY>上一轮：<USER_REQUEST>旧请求</USER_REQUEST></CONTEXT_SUMMARY>"
+        self.assertIsNone(core.derive_conversation_name(nested_sum_only))
+        nested_then_cur = f"{nested_sum_only}<USER_REQUEST>当前任务</USER_REQUEST>"
+        self.assertEqual(core.derive_conversation_name(nested_then_cur), "当前任务")
+        cid_nest = "conv-nested-sum-9007"
+        hook.handle_pre_invocation(self._base_payload(cid_nest, invocationNum=1, transcriptPath=tr_missing, lastUserInput=nested_sum_only))
+        st_n1 = core.load_session(cid_nest)
+        self.assertEqual(st_n1["conversationName"], "")
+        self.assertEqual(st_n1["firstUserInput"], "")
+        hook.handle_stop(self._base_payload(cid_nest, transcriptPath=tr_missing, lastUserInput=nested_sum_only, terminationReason="NO_TOOL_CALL", fullyIdle=True))
+        hook.handle_pre_invocation(self._base_payload(cid_nest, invocationNum=1, transcriptPath=tr_missing, lastUserInput=nested_then_cur))
+        st_n2 = core.load_session(cid_nest)
+        self.assertEqual(st_n2["firstUserInput"], "当前任务")
+        self.assertEqual(st_n2["conversationName"], "当前任务")
+
+        # 5h. Stop-hook regression: PreToolUse for next_step_side_panel delivering a new host conversationTitle persists it
+        # without resetting updatedAt / clearing TOOL_RUNNING watchdog staleness
+        cid_panel_rename = "conv-panel-rename-9008"
+        stale_ts = time.time() - 300.0
+        core.atomic_write_json(
+            core.session_path(cid_panel_rename),
+            {
+                "conversationId": cid_panel_rename,
+                "shortId": cid_panel_rename[:8],
+                "workspacePaths": [str(self.ws_dir)],
+                "lastUserInput": "旧初始标题",
+                "firstUserInput": "旧初始标题",
+                "conversationName": "旧初始标题",
+                "conversationNameSource": "derived",
+                "lifecycle": "TOOL_RUNNING",
+                "sourceType": "LIFECYCLE",
+                "confidence": "DETERMINISTIC",
+                "waitingOnUser": False,
+                "actor": "agent",
+                "nextAction": "正在执行工具：run_command",
+                "activeTool": {"id": "tc_hang", "name": "run_command", "startedAt": stale_ts, "mayWaitApproval": True},
+                "updatedAt": stale_ts,
+                "updatedAtIso": core.iso_now(stale_ts),
+            },
+        )
+        pre_sp_rename = hook.handle_pre_tool_use(
+            self._base_payload(
+                cid_panel_rename,
+                stepIdx=3,
+                transcriptPath=tr_missing,
+                lastUserInput="",
+                conversationTitle="宿主打开侧栏时的新名称",
+                toolCall={"id": "tc_sp_rn", "name": "mcp_next-step_next_step_side_panel", "args": {}},
+            )
+        )
+        self.assertEqual(core.load_session(cid_panel_rename)["updatedAt"], stale_ts)
+        sp_rename_res = mcp_server._handle_tool_call("next_step_side_panel", pre_sp_rename["overwrite"])
+        sel_rename = sp_rename_res["structuredContent"]["selectedSession"]
+        self.assertEqual(sel_rename["conversationName"], "宿主打开侧栏时的新名称")
+        self.assertTrue(sel_rename["stale"])
+        self.assertTrue(sel_rename["copyBlocked"])
+        poll_rename = mcp_server._handle_tool_call("next_step_panel_state", {"conversation_id": cid_panel_rename})["structuredContent"]["selectedSession"]
+        self.assertEqual(poll_rename["conversationName"], "宿主打开侧栏时的新名称")
+        self.assertTrue(poll_rename["stale"])
+        self.assertTrue(poll_rename["copyBlocked"])
+
+        # 5i. Stop-hook regression: transcript.jsonl step 0 with truncated_fields=["content"] & unclosed <CONTEXT_SUMMARY> skips to step 1 real prompt
+        cid_tr_trunc = "conv-tr-trunc-9009"
+        tr_trunc_path = self.art_dir / "tr_truncated_fields.jsonl"
+        tr_trunc_path.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "step_index": 0,
+                            "type": "USER_INPUT",
+                            "source": "USER_EXPLICIT",
+                            "truncated_fields": ["content"],
+                            "content": "<CONTEXT_SUMMARY>被截断且无闭合标签的历史摘要正文",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "step_index": 1,
+                            "type": "USER_INPUT",
+                            "source": "USER_EXPLICIT",
+                            "content": "<USER_REQUEST>订单索引迁移</USER_REQUEST>",
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        # Read-only legacy resolution and PreInvocation persistence both resolve "订单索引迁移"
+        core.atomic_write_json(
+            core.session_path(cid_tr_trunc),
+            {
+                "conversationId": cid_tr_trunc,
+                "shortId": cid_tr_trunc[:8],
+                "workspacePaths": [str(self.ws_dir)],
+                "transcriptPath": str(tr_trunc_path),
+                "lastUserInput": "继续",
+                "lifecycle": "IDLE",
+                "sourceType": "NONE",
+                "waitingOnUser": False,
+                "actor": "none",
+                "updatedAt": time.time(),
+                "updatedAtIso": core.iso_now(),
+            },
+        )
+        self.assertEqual(
+            core.build_side_panel_payload(bound_cid=cid_tr_trunc, binding_mode="explicit")["selectedSession"]["conversationName"],
+            "订单索引迁移",
+        )
+        hook.handle_pre_invocation(
+            self._base_payload(
+                cid_tr_trunc,
+                invocationNum=1,
+                transcriptPath=str(tr_trunc_path),
+                lastUserInput="继续",
+            )
+        )
+        st_trt = core.load_session(cid_tr_trunc)
+        self.assertEqual(st_trt["firstUserInput"], "订单索引迁移")
+        self.assertEqual(st_trt["conversationName"], "订单索引迁移")
+
+        # 5j. Truncated nested <CONTEXT_SUMMARY> containing an old <USER_REQUEST> skips to step 1 instead of picking old request
+        cid_tr_nest_trunc = "conv-tr-nest-trunc-9010"
+        tr_nest_trunc = self.art_dir / "tr_nest_trunc.jsonl"
+        tr_nest_trunc.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "step_index": 0,
+                            "type": "USER_INPUT",
+                            "source": "USER_EXPLICIT",
+                            "truncated_fields": ["content"],
+                            "content": "<CONTEXT_SUMMARY>历史摘要：<USER_REQUEST>旧任务</USER_REQUEST>",
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "step_index": 1,
+                            "type": "USER_INPUT",
+                            "source": "USER_EXPLICIT",
+                            "content": "<USER_REQUEST>订单索引迁移</USER_REQUEST>",
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        core.atomic_write_json(
+            core.session_path(cid_tr_nest_trunc),
+            {
+                "conversationId": cid_tr_nest_trunc,
+                "shortId": cid_tr_nest_trunc[:8],
+                "workspacePaths": [str(self.ws_dir)],
+                "transcriptPath": str(tr_nest_trunc),
+                "lastUserInput": "继续",
+                "lifecycle": "IDLE",
+                "sourceType": "NONE",
+                "waitingOnUser": False,
+                "actor": "none",
+                "updatedAt": time.time(),
+                "updatedAtIso": core.iso_now(),
+            },
+        )
+        self.assertEqual(
+            core.build_side_panel_payload(bound_cid=cid_tr_nest_trunc, binding_mode="explicit")["selectedSession"]["conversationName"],
+            "订单索引迁移",
+        )
+        hook.handle_pre_invocation(
+            self._base_payload(cid_tr_nest_trunc, invocationNum=1, transcriptPath=str(tr_nest_trunc), lastUserInput="继续")
+        )
+        st_nt = core.load_session(cid_tr_nest_trunc)
+        self.assertEqual(st_nt["firstUserInput"], "订单索引迁移")
+        self.assertEqual(st_nt["conversationName"], "订单索引迁移")
+
+        # 5k. Truncated trailing host metadata does NOT cause double-stripping of literal <CONTEXT_SUMMARY> inside <USER_REQUEST>
+        cid_tr_lit = "conv-tr-lit-trunc-9011"
+        tr_lit_trunc = self.art_dir / "tr_lit_trunc.jsonl"
+        tr_lit_trunc.write_text(
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "truncated_fields": ["content"],
+                    "content": "<USER_REQUEST>解析 <CONTEXT_SUMMARY>保留正文</CONTEXT_SUMMARY> 的规则</USER_REQUEST><ADDITIONAL_METADATA>被截断的尾随宿主元数据",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        core.atomic_write_json(
+            core.session_path(cid_tr_lit),
+            {
+                "conversationId": cid_tr_lit,
+                "shortId": cid_tr_lit[:8],
+                "workspacePaths": [str(self.ws_dir)],
+                "transcriptPath": str(tr_lit_trunc),
+                "lastUserInput": "继续",
+                "lifecycle": "IDLE",
+                "sourceType": "NONE",
+                "waitingOnUser": False,
+                "actor": "none",
+                "updatedAt": time.time(),
+                "updatedAtIso": core.iso_now(),
+            },
+        )
+        expected_lit = "解析 <CONTEXT_SUMMARY>保留正文</CONTEXT_SUMMARY> 的规则"
+        self.assertEqual(
+            core.build_side_panel_payload(bound_cid=cid_tr_lit, binding_mode="explicit")["selectedSession"]["conversationName"],
+            expected_lit,
+        )
+        hook.handle_pre_invocation(
+            self._base_payload(cid_tr_lit, invocationNum=1, transcriptPath=str(tr_lit_trunc), lastUserInput="继续")
+        )
+        st_tl = core.load_session(cid_tr_lit)
+        self.assertEqual(st_tl["firstUserInput"], expected_lit)
+        self.assertEqual(st_tl["conversationName"], expected_lit)
+
+        # 5l. Legacy session with lastUserInput="继续" upgrades from derived_fallback to real firstUserInput on transcript-only update
+        cid_fb_up = "conv-fb-upgrade-9012"
+        core.atomic_write_json(
+            core.session_path(cid_fb_up),
+            {
+                "conversationId": cid_fb_up,
+                "shortId": cid_fb_up[:8],
+                "workspacePaths": [str(self.ws_dir)],
+                "lastUserInput": "继续",
+                "firstUserInput": "",
+                "conversationName": "",
+                "conversationNameSource": "",
+                "transcriptPath": "",
+                "lifecycle": "IDLE",
+                "sourceType": "NONE",
+                "waitingOnUser": False,
+                "actor": "none",
+                "updatedAt": time.time(),
+                "updatedAtIso": core.iso_now(),
+            },
+        )
+        hook.handle_pre_invocation(
+            self._base_payload(cid_fb_up, invocationNum=1, transcriptPath=tr_missing, lastUserInput="")
+        )
+        st_fb1 = core.load_session(cid_fb_up)
+        self.assertEqual(st_fb1["conversationName"], "继续")
+        self.assertEqual(st_fb1["conversationNameSource"], "derived_fallback")
+
+        # Intermediate Hook carrying lastUserInput="继续" while transcript still unreadable must NOT promote to derived
+        hook.handle_pre_invocation(
+            self._base_payload(cid_fb_up, invocationNum=2, transcriptPath=tr_missing, lastUserInput="继续")
+        )
+        st_fb_mid = core.load_session(cid_fb_up)
+        self.assertEqual(st_fb_mid["firstUserInput"], "")
+        self.assertEqual(st_fb_mid["conversationName"], "继续")
+        self.assertEqual(st_fb_mid["conversationNameSource"], "derived_fallback")
+
+        tr_orders = self.art_dir / "tr_orders.jsonl"
+        tr_orders.write_text(
+            json.dumps(
+                {
+                    "step_index": 0,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "<USER_REQUEST>订单索引迁移</USER_REQUEST>",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        # Read-only panel item must resolve live transcript title when stored source is derived_fallback
+        st_ro_preview = dict(st_fb_mid, transcriptPath=str(tr_orders))
+        self.assertEqual(
+            core.build_session_panel_item(st_ro_preview)["conversationName"],
+            "订单索引迁移",
+        )
+        hook.handle_pre_invocation(
+            self._base_payload(cid_fb_up, invocationNum=3, transcriptPath=str(tr_orders), lastUserInput="")
+        )
+        st_fb2 = core.load_session(cid_fb_up)
+        self.assertEqual(st_fb2["firstUserInput"], "订单索引迁移")
+        self.assertEqual(st_fb2["conversationName"], "订单索引迁移")
+        self.assertEqual(st_fb2["conversationNameSource"], "derived")
+        self.assertEqual(
+            core.build_side_panel_payload(bound_cid=cid_fb_up, binding_mode="explicit")["selectedSession"]["conversationName"],
+            "订单索引迁移",
+        )
+
+        # 5m. Nested <CONTEXT_SUMMARY> blocks (balanced, truncated-with-inner-USER_REQUEST, and unclosed literal+balanced)
+        nested_bal = (
+            "<CONTEXT_SUMMARY>外层总结提到了 <CONTEXT_SUMMARY>历史摘要</CONTEXT_SUMMARY> 历史任务</CONTEXT_SUMMARY>"
+            "<USER_REQUEST>当前任务</USER_REQUEST>"
+        )
+        self.assertEqual(core.derive_conversation_name(nested_bal), "当前任务")
+        self.assertEqual(core.sanitize_user_input(nested_bal), "当前任务")
+        lit_plus_balanced = "说明 <CONTEXT_SUMMARY> 的用途，并删除示例 <CONTEXT_SUMMARY>样例</CONTEXT_SUMMARY> 后重试"
+        self.assertEqual(
+            core.sanitize_user_input(lit_plus_balanced),
+            "说明 <CONTEXT_SUMMARY> 的用途，并删除示例 后重试",
+        )
+        self.assertEqual(
+            core.derive_conversation_name(lit_plus_balanced),
+            "说明 <CONTEXT_SUMMARY> 的用途，并删除示例 后重试",
+        )
+
+        cid_nest_bal = "conv-nest-bal-9013"
+        tr_nest_bal_trunc = self.art_dir / "tr_nest_bal_trunc.jsonl"
+        tr_nest_bal_trunc.write_text(
+            "\n".join(
+                [
+                    json.dumps(
+                        {
+                            "step_index": 0,
+                            "type": "USER_INPUT",
+                            "source": "USER_EXPLICIT",
+                            "truncated_fields": ["content"],
+                            "content": (
+                                "<CONTEXT_SUMMARY>外层摘要：<CONTEXT_SUMMARY>历史摘要</CONTEXT_SUMMARY>"
+                                " 历史任务：<USER_REQUEST>旧请求</USER_REQUEST> 尚未闭合"
+                            ),
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "step_index": 1,
+                            "type": "USER_INPUT",
+                            "source": "USER_EXPLICIT",
+                            "content": "<USER_REQUEST>当前任务</USER_REQUEST>",
+                        }
+                    ),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        core.atomic_write_json(
+            core.session_path(cid_nest_bal),
+            {
+                "conversationId": cid_nest_bal,
+                "shortId": cid_nest_bal[:8],
+                "workspacePaths": [str(self.ws_dir)],
+                "transcriptPath": str(tr_nest_bal_trunc),
+                "lastUserInput": "继续",
+                "lifecycle": "IDLE",
+                "sourceType": "NONE",
+                "waitingOnUser": False,
+                "actor": "none",
+                "updatedAt": time.time(),
+                "updatedAtIso": core.iso_now(),
+            },
+        )
+        self.assertEqual(
+            core.build_side_panel_payload(bound_cid=cid_nest_bal, binding_mode="explicit")["selectedSession"]["conversationName"],
+            "当前任务",
+        )
+        hook.handle_pre_invocation(
+            self._base_payload(cid_nest_bal, invocationNum=1, transcriptPath=str(tr_nest_bal_trunc), lastUserInput="继续")
+        )
+        st_nb = core.load_session(cid_nest_bal)
+        self.assertEqual(st_nb["firstUserInput"], "当前任务")
+        self.assertEqual(st_nb["conversationName"], "当前任务")
+
+    def test_antigravity_native_sidebar_titles_pbtxt_sqlite_and_side_question(self) -> None:
+        """Resolve real Antigravity sidebar titles read-only from .pbtxt and SQLite WAL without side-effects."""
+        import hashlib
+        import sqlite3
+
+        # 1. Direct .pbtxt parser edge cases (octal UTF-8, escapes, braces in quotes, comments, adjacent strings, nesting)
+        pb_complex = """
+        # Comment before header
+        last_viewed: { seconds: 1700000000 title: "NestedShouldBeIgnored" }
+        title: "Fix \\"quoted\\" {braces}"
+        side_question_titles: {
+          value: "Side Question Value First"
+          key: "side-order-1"
+        }
+        other_msg: {
+          title: "AnotherNestedTitle"
+        }
+        side_question_titles: { key: "side-octal" value: "Next Step " "\\345\\260\\217\\345\\267\\245\\345\\205\\267" }
+        """
+        parsed_title, parsed_side = core._parse_pbtxt_annotation(pb_complex)
+        self.assertEqual(parsed_title, 'Fix "quoted" {braces}')
+        self.assertEqual(parsed_side["side-order-1"], "Side Question Value First")
+        self.assertEqual(parsed_side["side-octal"], "Next Step 小工具")
+
+        adj_title, _ = core._parse_pbtxt_annotation(
+            'title: "Application " # inline comment\n"Configuration File Checks"\n'
+        )
+        self.assertEqual(adj_title, "Application Configuration File Checks")
+
+        with tempfile.TemporaryDirectory() as td:
+            fake_app = Path(td).resolve() / "fake_app"
+            fake_brain = fake_app / "brain"
+            fake_ann = fake_app / "annotations"
+            fake_ann.mkdir(parents=True, exist_ok=True)
+            fake_db = fake_app / "conversation_summaries.db"
+
+            def _make_session(
+                cid: str,
+                *,
+                brain_subdir: bool = True,
+                conv_name: str = "",
+                conv_source: str = "",
+                last_input: str = "继续",
+                updated_offset: float = 0.0,
+            ) -> None:
+                art_path = (fake_brain / cid) if brain_subdir else (self.art_dir / cid)
+                art_path.mkdir(parents=True, exist_ok=True)
+                ts = time.time() - updated_offset
+                core.atomic_write_json(
+                    core.session_path(cid),
+                    {
+                        "conversationId": cid,
+                        "shortId": cid[:8],
+                        "workspacePaths": [str(self.ws_dir)],
+                        "artifactDirectoryPath": str(art_path),
+                        "transcriptPath": str(art_path / ".system_generated" / "logs" / "transcript.jsonl"),
+                        "conversationName": conv_name,
+                        "conversationNameSource": conv_source,
+                        "lastUserInput": last_input,
+                        "lifecycle": "IDLE",
+                        "sourceType": "NONE",
+                        "waitingOnUser": False,
+                        "actor": "none",
+                        "updatedAt": ts,
+                        "updatedAtIso": core.iso_now(ts),
+                    },
+                )
+
+            # 2. Live rename, priority order (host > native pbtxt > explicit/derived), & cache invalidation
+            cid_live = "live-pbtxt-1111-0001"
+            pb_live = fake_ann / f"{cid_live}.pbtxt"
+            pb_live.write_text('title:"Antigravity Prompt Optimizer Plugin"\n', encoding="utf-8")
+            _make_session(
+                cid_live,
+                conv_name="旧派生标题",
+                conv_source="derived",
+                updated_offset=10.0,
+            )
+
+            panel1 = core.build_side_panel_payload(bound_cid=cid_live, binding_mode="explicit")
+            self.assertEqual(panel1["selectedSession"]["conversationName"], "Antigravity Prompt Optimizer Plugin")
+            md1 = core.format_session_markdown(core.load_session(cid_live))
+            self.assertIn("### Antigravity Prompt Optimizer Plugin ·", md1)
+
+            # Explicit name persisted earlier is overridden by native Antigravity sidebar title
+            st_exp = core.load_session(cid_live)
+            st_exp["conversationName"] = "旧显式名称"
+            st_exp["conversationNameSource"] = "explicit"
+            core.save_session(cid_live, st_exp)
+            panel1b = core.build_side_panel_payload(bound_cid=cid_live, binding_mode="explicit")
+            self.assertEqual(panel1b["selectedSession"]["conversationName"], "Antigravity Prompt Optimizer Plugin")
+
+            # Renaming in sidebar rewrites .pbtxt -> stat cache invalidates immediately
+            old_stat = pb_live.stat()
+            pb_live.write_text('title:"Next Step \\345\\260\\217\\345\\267\\245\\345\\205\\267\\346\\265\\213\\350\\257\\225\\346\\226\\271\\346\\263\\225"\n', encoding="utf-8")
+            os.utime(pb_live, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + 2_000_000_000))
+            panel2 = core.build_side_panel_payload(bound_cid=cid_live, binding_mode="explicit")
+            self.assertEqual(panel2["selectedSession"]["conversationName"], "Next Step 小工具测试方法")
+
+            # Host hook title retains highest precedence over local .pbtxt
+            st_host = core.load_session(cid_live)
+            st_host["conversationName"] = "宿主实时标题"
+            st_host["conversationNameSource"] = "host"
+            core.save_session(cid_live, st_host)
+            panel_host = core.build_side_panel_payload(bound_cid=cid_live, binding_mode="hook_bound")
+            self.assertEqual(panel_host["selectedSession"]["conversationName"], "宿主实时标题")
+
+            # 3. Separate-process SQLite WAL lifecycle (empty -> active WAL -> live rename -> PASSIVE ckpt -> TRUNCATE+close)
+            #    verifying exact SHA-256 byte-for-byte immutability across .db, -wal, and -shm at every state.
+            cid_parent = "parent-mvp-2222-0002"
+            cid_db_only = "dbonly-codex-3333-0003"
+            cid_side_q = "sideq-fork-4444-0004"
+            cid_live_wal = "livewal-5555-0005"
+
+            (fake_ann / f"{cid_parent}.pbtxt").write_text(
+                f'title:"Antigravity Next Step Plugin MVP"\nside_question_titles:{{key:"{cid_side_q}" value:"UI Comparison And Fork Review"}}\n',
+                encoding="utf-8",
+            )
+            _make_session(cid_parent, conv_name="fallback-p", conv_source="derived", updated_offset=20.0)
+            _make_session(cid_db_only, conv_name="fallback-d", conv_source="derived", updated_offset=30.0)
+            _make_session(cid_side_q, conv_name="fallback-s", conv_source="derived", updated_offset=40.0)
+            _make_session(cid_live_wal, conv_name="fallback-w", conv_source="derived", updated_offset=5.0)
+
+            def _snapshot_db_hashes() -> dict[str, tuple[str, int]]:
+                out: dict[str, tuple[str, int]] = {}
+                for fname in (
+                    "conversation_summaries.db",
+                    "conversation_summaries.db-wal",
+                    "conversation_summaries.db-shm",
+                ):
+                    fp = fake_app / fname
+                    if fp.exists():
+                        raw = fp.read_bytes()
+                        out[fname] = (hashlib.sha256(raw).hexdigest(), len(raw))
+                return out
+
+            writer_script = "\n".join(
+                [
+                    "import sqlite3, sys",
+                    "db_path, cid_p, cid_d, cid_sq, cid_w = sys.argv[1:6]",
+                    "c = sqlite3.connect(db_path)",
+                    "c.execute('PRAGMA journal_mode=WAL')",
+                    "c.execute('CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)')",
+                    "c.execute('CREATE TABLE conversation_parents (conversation_id TEXT PRIMARY KEY, parent_id TEXT)')",
+                    "c.execute('INSERT INTO conversation_summaries VALUES (?, ?)', (cid_p, 'Antigravity Next Step Plugin MVP'))",
+                    "c.commit()",
+                    "c.execute('PRAGMA wal_checkpoint(TRUNCATE)')",
+                    "print('READY_V0', flush=True)",
+                    "for line in sys.stdin:",
+                    "    cmd = line.strip()",
+                    "    if cmd == 'v1':",
+                    "        c.execute('INSERT INTO conversation_summaries VALUES (?, ?)', (cid_d, 'Configure Codex Audit Model'))",
+                    "        c.execute('INSERT INTO conversation_parents VALUES (?, ?)', (cid_sq, cid_p))",
+                    "        c.commit()",
+                    "        print('READY_V1', flush=True)",
+                    "    elif cmd == 'v2':",
+                    "        c.execute('UPDATE conversation_summaries SET title = ? WHERE conversation_id = ?', ('Configure Codex Audit Model v2', cid_d))",
+                    "        c.execute('INSERT INTO conversation_summaries VALUES (?, ?)', (cid_w, 'Application Configuration File Checks'))",
+                    "        c.commit()",
+                    "        print('READY_V2', flush=True)",
+                    "    elif cmd == 'passive_v3':",
+                    "        c.execute('PRAGMA wal_checkpoint(PASSIVE)')",
+                    "        c.execute('UPDATE conversation_summaries SET title = ? WHERE conversation_id = ?', ('Configure Codex Audit Model v3', cid_d))",
+                    "        c.commit()",
+                    "        print('READY_V3', flush=True)",
+                    "    elif cmd == 'truncate_close':",
+                    "        c.execute('PRAGMA wal_checkpoint(TRUNCATE)')",
+                    "        c.close()",
+                    "        print('CLOSED', flush=True)",
+                    "        break",
+                ]
+            )
+
+            proc = subprocess.Popen(
+                [sys.executable, "-c", writer_script, str(fake_db), cid_parent, cid_db_only, cid_side_q, cid_live_wal],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            wal_file = Path(f"{fake_db}-wal")
+            shm_file = Path(f"{fake_db}-shm")
+            try:
+                # V0: Empty/zeroed WAL after TRUNCATE checkpoint while writer holds DB open
+                self.assertEqual(proc.stdout.readline().strip(), "READY_V0")
+                h0_before = _snapshot_db_hashes()
+                p0 = core.build_side_panel_payload()
+                by0 = {item["conversationId"]: item["conversationName"] for item in p0["sessions"]}
+                self.assertEqual(by0[cid_parent], "Antigravity Next Step Plugin MVP")
+                self.assertEqual(by0[cid_db_only], "fallback-d")
+                self.assertEqual(_snapshot_db_hashes(), h0_before)
+
+                # V1: Active WAL commit (reader must see committed WAL rows & parent side-question, zero -shm write!)
+                proc.stdin.write("v1\n")
+                proc.stdin.flush()
+                self.assertEqual(proc.stdout.readline().strip(), "READY_V1")
+                self.assertTrue(wal_file.is_file() and wal_file.stat().st_size > 0)
+                self.assertTrue(shm_file.is_file())
+                h1_before = _snapshot_db_hashes()
+                p1 = core.build_side_panel_payload()
+                by1 = {item["conversationId"]: item["conversationName"] for item in p1["sessions"]}
+                self.assertEqual(by1[cid_db_only], "Configure Codex Audit Model")
+                self.assertEqual(by1[cid_side_q], "UI Comparison And Fork Review")
+                self.assertEqual(_snapshot_db_hashes(), h1_before)
+
+                # V2: Live rename & insert while writer holds connection open -> immediate visibility & zero byte drift
+                proc.stdin.write("v2\n")
+                proc.stdin.flush()
+                self.assertEqual(proc.stdout.readline().strip(), "READY_V2")
+                h2_before = _snapshot_db_hashes()
+                p2 = core.build_side_panel_payload()
+                by2 = {item["conversationId"]: item["conversationName"] for item in p2["sessions"]}
+                self.assertEqual(by2[cid_db_only], "Configure Codex Audit Model v2")
+                self.assertEqual(by2[cid_live_wal], "Application Configuration File Checks")
+                self.assertEqual(_snapshot_db_hashes(), h2_before)
+
+                # V3: PASSIVE checkpoint + follow-up rename -> cache invalidates cleanly across non-truncating checkpoint
+                proc.stdin.write("passive_v3\n")
+                proc.stdin.flush()
+                self.assertEqual(proc.stdout.readline().strip(), "READY_V3")
+                h3_before = _snapshot_db_hashes()
+                p3 = core.build_side_panel_payload()
+                by3 = {item["conversationId"]: item["conversationName"] for item in p3["sessions"]}
+                self.assertEqual(by3[cid_db_only], "Configure Codex Audit Model v3")
+                self.assertEqual(_snapshot_db_hashes(), h3_before)
+
+                # V4: TRUNCATE checkpoint + close -> zero -wal/-shm sidecars exist or get created, SHA-256 unchanged
+                proc.stdin.write("truncate_close\n")
+                proc.stdin.flush()
+                self.assertEqual(proc.stdout.readline().strip(), "CLOSED")
+            finally:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.close()
+                proc.wait(timeout=5)
+
+            self.assertFalse(wal_file.exists())
+            self.assertFalse(shm_file.exists())
+            before_dir_entries = sorted(p.name for p in fake_app.iterdir())
+            h4_before = _snapshot_db_hashes()
+            p4 = core.build_side_panel_payload()
+            by4 = {item["conversationId"]: item["conversationName"] for item in p4["sessions"]}
+            self.assertEqual(by4[cid_db_only], "Configure Codex Audit Model v3")
+            self.assertEqual(_snapshot_db_hashes(), h4_before)
+            self.assertEqual(sorted(p.name for p in fake_app.iterdir()), before_dir_entries)
+
+            # 3b. Unstable states: hot rollback -journal, mismatched WalIndexHdr twin copies, & mid-copy race retry/exhaustion
+            race_app = Path(td).resolve() / "race_app"
+            (race_app / "brain" / "r1").mkdir(parents=True, exist_ok=True)
+            race_db = race_app / "conversation_summaries.db"
+            rc = sqlite3.connect(str(race_db))
+            rc.execute("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)")
+            rc.execute("INSERT INTO conversation_summaries VALUES ('race-cid', 'Stable Race Title')")
+            rc.commit()
+            rc.close()
+
+            # Non-empty -journal pauses DB read cleanly without caching failure
+            hot_journal = Path(f"{race_db}-journal")
+            hot_journal.write_bytes(b"active-hot-rollback-journal")
+            race_state = {
+                "conversationId": "race-cid",
+                "artifactDirectoryPath": str(race_app / "brain" / "r1"),
+                "conversationName": "回退标题",
+                "conversationNameSource": "derived",
+            }
+            self.assertEqual(core._load_summaries_db_maps(race_db), ({}, {}))
+            self.assertEqual(core.resolve_session_conversation_name(race_state), "回退标题")
+            hot_journal.unlink()
+            self.assertEqual(core.resolve_session_conversation_name(race_state), "Stable Race Title")
+
+            # Mismatched WalIndexHdr twin copies in -shm report UNSTABLE and skip reading torn WAL
+            bad_shm = Path(f"{race_db}-shm")
+            bad_shm.write_bytes(b"A" * 48 + b"B" * 48 + b"\x00" * 4)
+            self.assertEqual(core._snapshot_db_signature(race_db), ("UNSTABLE", None, 0))
+            with mock.patch.object(core.time, "sleep"):
+                self.assertEqual(core._load_summaries_db_maps(race_db), ({}, {}))
+            bad_shm.unlink()
+
+            # Clear DB cache cleanly and verify mid-copy race retry recovery & exhaustion degradation
+            core._SUMMARIES_DB_CACHE.clear()
+            st_race = race_db.stat()
+            sig_a = (str(race_db), (st_race.st_mtime_ns, st_race.st_size, st_race.st_ino), b"A" * 100, None, b"", None, None)
+            sig_b = (str(race_db), (st_race.st_mtime_ns + 1, st_race.st_size, st_race.st_ino), b"B" * 100, None, b"", None, None)
+            sig_c = (str(race_db), (st_race.st_mtime_ns + 2, st_race.st_size, st_race.st_ino), b"C" * 100, None, b"", None, None)
+
+            with (
+                mock.patch.object(core.time, "sleep"),
+                mock.patch.object(
+                    core,
+                    "_snapshot_db_signature",
+                    side_effect=[
+                        ("OK", sig_a, st_race.st_size),
+                        ("OK", sig_b, st_race.st_size),
+                        ("OK", sig_c, st_race.st_size),
+                        ("OK", sig_c, st_race.st_size),
+                    ],
+                ),
+            ):
+                tmap_retry, _ = core._load_summaries_db_maps(race_db)
+                self.assertEqual(tmap_retry.get("race-cid"), "Stable Race Title")
+
+            core._SUMMARIES_DB_CACHE.clear()
+            with (
+                mock.patch.object(core.time, "sleep"),
+                mock.patch.object(
+                    core,
+                    "_snapshot_db_signature",
+                    side_effect=[
+                        ("OK", sig_a, st_race.st_size),
+                        ("OK", sig_b, st_race.st_size),
+                        ("OK", sig_a, st_race.st_size),
+                        ("OK", sig_b, st_race.st_size),
+                        ("OK", sig_a, st_race.st_size),
+                        ("OK", sig_b, st_race.st_size),
+                    ],
+                ),
+            ):
+                self.assertEqual(core._load_summaries_db_maps(race_db), ({}, {}))
+            # Subsequent unmocked poll still succeeds because failed retries were not cached
+            self.assertEqual(core.resolve_session_conversation_name(race_state), "Stable Race Title")
+
+            # Disk-full TemporaryDirectory OSError falls back cleanly without failing next_step_panel_state
+            cid_diskfull = "diskfull-fallback-7777"
+            _make_session(cid_diskfull, conv_name="订单迁移", conv_source="explicit", updated_offset=2.0)
+            core._SUMMARIES_DB_CACHE.clear()
+            with (
+                mock.patch.object(core.time, "sleep"),
+                mock.patch.object(
+                    core.tempfile,
+                    "TemporaryDirectory",
+                    side_effect=OSError(28, "No space left on device"),
+                ),
+            ):
+                df_res = mcp_server._handle_tool_call("next_step_panel_state", {"conversation_id": cid_diskfull})
+                self.assertFalse(df_res.get("isError", False))
+                self.assertEqual(df_res["structuredContent"]["selectedSession"]["conversationName"], "订单迁移")
+
+            # Source DB growing beyond MAX_SUMMARIES_DB_BYTES mid-copy aborts at recorded cap without exceeding cap
+            core._SUMMARIES_DB_CACHE.clear()
+            small_cap = 2048
+            self.assertGreater(race_db.stat().st_size, small_cap)
+            sig_grown = (str(race_db), (st_race.st_mtime_ns, small_cap, st_race.st_ino), b"G" * 100, None, b"", None, None)
+            written_sizes: list[int] = []
+            real_copy_capped = core._copy_exact_cap
+
+            def _spy_copy_capped(src: object, dst: object, cap_bytes: int, chunk_size: int = 1024 * 1024) -> bool:
+                ok = real_copy_capped(src, dst, cap_bytes, chunk_size)
+                written_sizes.append(dst.tell())
+                return ok
+
+            with (
+                mock.patch.object(core, "MAX_SUMMARIES_DB_BYTES", small_cap),
+                mock.patch.object(core.time, "sleep"),
+                mock.patch.object(core, "_copy_exact_cap", side_effect=_spy_copy_capped),
+                mock.patch.object(
+                    core,
+                    "_snapshot_db_signature",
+                    return_value=("OK", sig_grown, small_cap),
+                ),
+            ):
+                self.assertEqual(core._load_summaries_db_maps(race_db), ({}, {}))
+            self.assertEqual(len(written_sizes), core.MAX_DB_SNAPSHOT_RETRIES)
+            self.assertTrue(all(sz <= small_cap for sz in written_sizes))
+            self.assertEqual(core.resolve_session_conversation_name(race_state), "Stable Race Title")
+
+            # 4. plugin_data sibling fallback + strict isolation + graceful degradation on bad files & traversal
+            nested_plugin_data = fake_app / "plugin_data" / "next-step"
+            nested_plugin_data.mkdir(parents=True, exist_ok=True)
+            try:
+                core.set_data_dir(nested_plugin_data)
+                cid_no_paths = "no-paths-pbtxt-6666"
+                (fake_ann / f"{cid_no_paths}.pbtxt").write_text('title:"Sibling PluginData Title"\n', encoding="utf-8")
+                no_path_state = {
+                    "conversationId": cid_no_paths,
+                    "shortId": cid_no_paths[:8],
+                    "workspacePaths": [str(self.ws_dir)],
+                    "conversationName": "",
+                    "conversationNameSource": "",
+                    "lastUserInput": "继续",
+                    "lifecycle": "IDLE",
+                    "sourceType": "NONE",
+                    "waitingOnUser": False,
+                    "actor": "none",
+                    "updatedAt": time.time(),
+                    "updatedAtIso": core.iso_now(),
+                }
+                self.assertEqual(core.resolve_antigravity_native_title(no_path_state), "Sibling PluginData Title")
+                self.assertEqual(core.resolve_session_conversation_name(no_path_state), "Sibling PluginData Title")
+            finally:
+                core.set_data_dir(self.data_dir)
+
+            # Corrupt DB, schema drift without conversation_parents, malformed .pbtxt, & traversal cid all degrade silently
+            bad_app = Path(td).resolve() / "bad_app"
+            (bad_app / "annotations").mkdir(parents=True, exist_ok=True)
+            (bad_app / "brain" / "sess").mkdir(parents=True, exist_ok=True)
+            (bad_app / "conversation_summaries.db").write_bytes(b"not a valid sqlite database file")
+            (bad_app / "annotations" / "bad-pb.pbtxt").write_text('title: "unclosed\nside_question_titles: { key: "x', encoding="utf-8")
+            bad_state = {
+                "conversationId": "bad-pb",
+                "shortId": "bad-pb",
+                "artifactDirectoryPath": str(bad_app / "brain" / "sess"),
+                "conversationName": "保留显式回退",
+                "conversationNameSource": "explicit",
+            }
+            self.assertIsNone(core.resolve_antigravity_native_title(bad_state))
+            self.assertEqual(core.resolve_session_conversation_name(bad_state), "保留显式回退")
+
+            traversal_state = {
+                "conversationId": "../escape",
+                "artifactDirectoryPath": str(fake_brain / "sess"),
+            }
+            self.assertIsNone(core.resolve_antigravity_native_title(traversal_state))
+
+            # Schema drift: DB without conversation_parents table still resolves summaries and skips parents cleanly
+            drift_app = Path(td).resolve() / "drift_app"
+            (drift_app / "brain" / "s1").mkdir(parents=True, exist_ok=True)
+            drift_db = drift_app / "conversation_summaries.db"
+            dc = sqlite3.connect(str(drift_db))
+            dc.execute("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT)")
+            dc.execute("INSERT INTO conversation_summaries VALUES ('drift-sum', 'Drift Table Summary Title')")
+            dc.commit()
+            dc.close()
+            self.assertEqual(
+                core.resolve_antigravity_native_title(
+                    {"conversationId": "drift-sum", "artifactDirectoryPath": str(drift_app / "brain" / "s1")}
+                ),
+                "Drift Table Summary Title",
+            )
+            self.assertIsNone(
+                core.resolve_antigravity_native_title(
+                    {"conversationId": "drift-miss", "artifactDirectoryPath": str(drift_app / "brain" / "s1")}
+                )
+            )
+
+            # Isolation invariant: non-'brain' test artifact path with real host UUID NEVER touches host ~/.gemini/antigravity/
+            isolated_host_uuid_state = {
+                "conversationId": "a7bea7d3-0c0d-4be2-ad3b-34fe546c1a23",
+                "artifactDirectoryPath": str(self.art_dir),
+                "transcriptPath": str(self.art_dir / "transcript.jsonl"),
+                "firstUserInput": "测试隔离名称",
+            }
+            self.assertIsNone(core.resolve_antigravity_native_title(isolated_host_uuid_state))
+            self.assertEqual(core.resolve_session_conversation_name(isolated_host_uuid_state), "测试隔离名称")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -77,6 +77,10 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": "Optional path to the associated plan/task artifact (tracked by SHA-256 to detect plan rewrites).",
                 },
+                "conversation_name": {
+                    "type": "string",
+                    "description": "Optional concise human-readable title for this conversation shown ahead of the session ID in the HUD.",
+                },
                 "conversation_id": {
                     "type": "string",
                     "description": "Optional conversation UUID (automatically injected/verified by PreToolUse/PostToolUse hooks).",
@@ -238,6 +242,8 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             }
 
         cid = str(state.get("conversationId") or "")
+        conv_name = core.resolve_session_conversation_name(state)
+        header_ref = f"{conv_name} · `#{cid[:8]}`" if conv_name else f"会话 `{cid[:8]}`"
         actor_label = core.format_actor_label(decl.get("actor"), bool(decl.get("waiting_on_user")))
         wait_label = "🔴 等我处理/确认" if decl.get("waiting_on_user") else "🟢 Agent 继续/后台执行"
         plan = decl.get("planArtifact")
@@ -249,7 +255,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
         )
 
         text = (
-            f"**已发布下一步指令**（会话 `{cid[:8]}`）\n"
+            f"**已发布下一步指令**（{header_ref}）\n"
             f"- **是否在等我**：`{wait_label}`\n"
             f"- **由谁做**：`{actor_label}`\n"
             f"- **接下来要做什么**：**{decl['next_action']}**"

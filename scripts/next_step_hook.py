@@ -273,6 +273,8 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
                 artifact_dir=art_dir or None,
                 step_idx=step_idx,
                 write_pending_buffer=True,
+                state=state,
+                commit_conversation_name=False,
             )
             sys_inject: dict[str, Any] = {
                 "_sys_conversation_id": raw_cid,
@@ -290,6 +292,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
                 artifact_dir=art_dir or None,
                 step_idx=step_idx,
                 write_pending_buffer=False,
+                commit_conversation_name=False,
             )
             sys_inject = {"_sys_step_idx": step_idx}
             if art_dir:
@@ -317,8 +320,28 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
     if is_panel:
         clean_panel_args = _strip_reserved_sys_args(panel_args)
         if raw_cid:
+            sp_exists = core.session_path(raw_cid).is_file()
             state = core.load_session(raw_cid)
+            prev_updated_at = state.get("updatedAt")
+            prev_title_meta = (
+                state.get("conversationName"),
+                state.get("conversationNameSource"),
+                state.get("firstUserInput"),
+                list(state.get("workspacePaths") or []),
+            )
             core.update_common_metadata(state, payload)
+            if sp_exists and (
+                state.get("conversationName"),
+                state.get("conversationNameSource"),
+                state.get("firstUserInput"),
+                list(state.get("workspacePaths") or []),
+            ) != prev_title_meta:
+                preserved_now = (
+                    float(prev_updated_at)
+                    if isinstance(prev_updated_at, (int, float)) and prev_updated_at > 0
+                    else None
+                )
+                core.save_session(raw_cid, state, now=preserved_now)
             sys_inject_panel: dict[str, Any] = {
                 "_sys_conversation_id": raw_cid,
                 "_sys_workspace_paths": state.get("workspacePaths") or [],
@@ -507,6 +530,8 @@ def handle_post_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             artifact_dir=state.get("artifactDirectoryPath") or None,
             step_idx=step_idx,
             write_pending_buffer=False,
+            state=state,
+            commit_conversation_name=True,
         )
         if decl is None and raw_cid:
             claimed = core.claim_latest_pending_declaration(
@@ -514,6 +539,8 @@ def handle_post_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
                 min_created_at=float(state.get("turnStartedAt") or 0.0),
             )
             if claimed is not None:
+                if claimed.get("conversation_name"):
+                    core._apply_conversation_name(state, claimed["conversation_name"], "explicit")
                 state["pendingDeclaration"] = claimed
                 state["planArtifact"] = claimed.get("planArtifact")
                 core.save_session(cid, state)

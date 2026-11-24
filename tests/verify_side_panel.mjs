@@ -304,6 +304,7 @@ function makeSessionItem(cid, nextAction, prompt, opts = {}) {
   return {
     conversationId: cid,
     shortId: cid.slice(0, 8),
+    ...(opts.conversationName !== undefined ? { conversationName: opts.conversationName } : {}),
     workspaceName: opts.workspaceName || "repo-test",
     lifecycle: opts.stale ? "IDLE" : "WAITING_USER_DECISION",
     sourceType: opts.stale ? "STALE" : "AGENT_DECLARED",
@@ -1557,5 +1558,243 @@ dispatchTo(docListeners, "selectionchange");
 await flushMicrotasks();
 assert.ok(liveRegionText().includes("Agent 运行中"), "11c FAIL: live region not updated to new status");
 console.log("[PASS] 11. Selection defers list-only changes; prompt withdrawal and live-region updates render immediately");
+
+// 12. Conversation name displays ahead of #shortId across list, <select>, pill, card header, & loading banner;
+//     activeTool.elapsedSec-only ticks skip DOM rebuild while updating syncLabel.title, and approvalHint rebuilds at once.
+const namedWait = {
+  ...makeSessionItem("cid-name-1111", "审阅并合入主分支", "确认后请合入 main 并运行全部测试", {
+    workspaceName: "antigravity-next-step",
+    conversationName: "UI 样式对比与合入",
+  }),
+  lastUserInput: "这不应该替代对话名",
+};
+const fallbackWait = {
+  ...makeSessionItem("cid-anon-2222", "处理匿名会话", null, {
+    workspaceName: "repo-anon",
+    conversationName: null,
+  }),
+  lastUserInput: "匿名会话原始输入",
+};
+const namedTool = {
+  ...makeSessionItem("cid-tool-3333", "正在执行工具：run_command · npm test", null, {
+    workspaceName: "antigravity-next-step",
+    conversationName: "长时间构建与验证",
+  }),
+  lifecycle: "TOOL_RUNNING",
+  waitingOnUser: false,
+  actor: "agent",
+  actorLabel: "Agent（主会话）",
+  statusBadge: "🟢 Agent 运行中 (TOOL_RUNNING)",
+  sourceType: "LIFECYCLE",
+  activeTool: {
+    name: "run_command",
+    summary: "npm test",
+    elapsedSec: 2.1,
+  },
+};
+const namedSidebar37 = makeSessionItem("cid-side-3737", "审核配置状态", null, {
+  workspaceName: "antigravity-next-step",
+  conversationName: "Application Configuration File Checks",
+});
+const namedSessions = [namedWait, fallbackWait, namedTool, namedSidebar37];
+
+sendHostNotification("ui/notifications/tool-input", { arguments: {} });
+await flushMicrotasks();
+sendHostNotification("ui/notifications/tool-result", {
+  content: [{ type: "text", text: "named list" }],
+  structuredContent: makePayload({
+    bindingMode: "unbound",
+    boundConversationId: null,
+    selectedSession: null,
+    sessions: namedSessions,
+  }),
+});
+await flushMicrotasks();
+
+// 12a. Unbound list cards & <select> options put conversationName BEFORE #shortId; null falls back cleanly
+const listButtons12 = findSessionListEl().findAll((n) => n.tagName === "BUTTON" && n.className.includes("ns-session-item"));
+const namedBtn12 = listButtons12.find((b) => b.textContent.includes("UI 样式对比与合入"));
+assert.ok(namedBtn12, "12a FAIL: Named session list button missing");
+assert.ok(namedBtn12.className.includes("has-name"), "12a FAIL: Named session card must include .has-name class");
+const namedTitleNodes12 = namedBtn12.findAll((n) => typeof n.className === "string" && n.className.includes("ns-session-name"));
+assert.equal(namedTitleNodes12.length, 1, "12a FAIL: Expected .ns-session-name node");
+assert.equal(namedTitleNodes12[0].textContent, "UI 样式对比与合入");
+const namedBtnText12 = namedBtn12.textContent;
+assert.ok(
+  namedBtnText12.indexOf("UI 样式对比与合入") < namedBtnText12.indexOf("#cid-name"),
+  "12a FAIL: conversationName must appear BEFORE #shortId inside session card",
+);
+
+const fallbackBtn12 = listButtons12.find((b) => b.textContent.includes("#cid-anon"));
+assert.ok(fallbackBtn12, "12a FAIL: Fallback anonymous session card missing");
+assert.ok(!fallbackBtn12.className.includes("has-name"), "12a FAIL: Unnamed fallback card must NOT have .has-name class");
+assert.ok(fallbackBtn12.textContent.includes("匿名会话原始输入"), "12a FAIL: Fallback card missing lastUserInput");
+
+const selectOpts12 = appRoot
+  .findAll((n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "选择 Antigravity 会话")[0]
+  .children.map((o) => o._text);
+const optNamed12 = selectOpts12.find((t) => t.includes("#cid-name"));
+assert.ok(optNamed12, "12a FAIL: <select> option missing for named session");
+assert.ok(
+  optNamed12.indexOf("UI 样式对比与合入") >= 0 &&
+    optNamed12.indexOf("UI 样式对比与合入") < optNamed12.indexOf("#cid-name"),
+  `12a FAIL: <select> option must place conversationName before #shortId, got: ${optNamed12}`,
+);
+const opt37 = selectOpts12.find((t) => t.includes("#cid-side"));
+assert.ok(
+  opt37 && opt37.includes("Application Configuration File Checks"),
+  `12a FAIL: 37-char sidebar title should render untruncated in <select>, got: ${opt37}`,
+);
+
+// 12b. Hook-bound pill & detail card header show conversationName in front
+sendHostNotification("ui/notifications/tool-input", { arguments: {} });
+await flushMicrotasks();
+sendHostNotification("ui/notifications/tool-result", {
+  content: [{ type: "text", text: "hook named" }],
+  structuredContent: makePayload({
+    bindingMode: "hook_bound",
+    boundConversationId: namedWait.conversationId,
+    selectedSession: namedWait,
+    sessions: namedSessions,
+  }),
+});
+await flushMicrotasks();
+assert.ok(renderedText().includes("已绑定：UI 样式对比与合入"), "12b FAIL: Bound pill missing conversationName");
+const boundPill12 = appRoot.findAll(
+  (n) => typeof n.className === "string" && n.className.includes("ns-bind-pill"),
+)[0];
+assert.ok(boundPill12, "12b FAIL: Bound pill missing");
+assert.ok(
+  boundPill12.textContent.includes("UI 样式对比与合入") &&
+    boundPill12.textContent.includes("#cid-name") &&
+    boundPill12.textContent.indexOf("UI 样式对比与合入") < boundPill12.textContent.indexOf("#cid-name"),
+  `12b FAIL: Bound pill must place conversationName before #shortId, got: ${boundPill12.textContent}`,
+);
+const card12 = findCards()[0];
+assert.ok(card12, "12b FAIL: Detail card missing");
+const cardTitle12 = card12.findAll((n) => typeof n.className === "string" && n.className.includes("ns-card-title"))[0];
+assert.ok(cardTitle12 && cardTitle12.textContent === "UI 样式对比与合入", "12b FAIL: Detail card header missing title");
+assert.ok(
+  card12.textContent.indexOf("UI 样式对比与合入") < card12.textContent.indexOf("#cid-name"),
+  "12b FAIL: conversationName must appear BEFORE #shortId inside detail card",
+);
+
+// 12c. Loading banner names the session & TOOL_RUNNING elapsedSec-only poll skips DOM rebuild while updating sync title
+const sessSel12 = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "选择 Antigravity 会话",
+)[0];
+sessSel12.value = namedTool.conversationId;
+sessSel12.onchange();
+await flushMicrotasks();
+assert.ok(renderedText().includes("已选定：长时间构建与验证"), "12c FAIL: Selected pill missing conversationName");
+const selPill12 = appRoot.findAll(
+  (n) => typeof n.className === "string" && n.className.includes("ns-bind-pill"),
+)[0];
+assert.ok(
+  selPill12 &&
+    selPill12.textContent.includes("长时间构建与验证") &&
+    selPill12.textContent.includes("#cid-tool") &&
+    selPill12.textContent.indexOf("长时间构建与验证") < selPill12.textContent.indexOf("#cid-tool"),
+  `12c FAIL: Selected pill must place conversationName before #shortId, got: ${selPill12?.textContent}`,
+);
+assert.ok(
+  renderedText().includes("正在加载会话「长时间构建与验证」(#cid-tool)"),
+  "12c FAIL: Loading banner must show conversationName ahead of #shortId",
+);
+
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "tool running" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "explicit",
+      boundConversationId: namedTool.conversationId,
+      selectedSession: namedTool,
+      sessions: namedSessions,
+    }),
+    generatedAtIso: "2026-11-22T00:01:00Z",
+  },
+});
+await flushMicrotasks();
+
+const containerBefore12 = appRoot.children[0];
+const syncEl12Before = appRoot.findAll((n) => typeof n.className === "string" && n.className.includes("ns-status-line"))[0].children[0];
+assert.ok(syncEl12Before.title.startsWith("2026-11-22T00:01:00Z"), "12c FAIL: Initial sync title missing");
+
+// Background poll updates only elapsedSec & generatedAtIso -> must NOT rebuild DOM, MUST update syncEl.title
+latestPollTimer().fn();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1);
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "tool tick" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "explicit",
+      boundConversationId: namedTool.conversationId,
+      selectedSession: {
+        ...namedTool,
+        activeTool: { ...namedTool.activeTool, elapsedSec: 5.4 },
+      },
+      sessions: namedSessions,
+    }),
+    generatedAtIso: "2026-11-22T00:05:10Z",
+  },
+});
+await flushMicrotasks();
+assert.equal(appRoot.children[0], containerBefore12, "12c FAIL: elapsedSec-only tick rebuilt DOM");
+assert.ok(
+  syncEl12Before.title.startsWith("2026-11-22T00:05:10Z"),
+  `12c FAIL: updateSyncLabel did not update title on skipped rebuild, got: ${syncEl12Before.title}`,
+);
+
+// Next poll adds approvalHint -> must rebuild immediately to surface approval banner
+latestPollTimer().fn();
+await flushMicrotasks();
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "tool approval hint" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "explicit",
+      boundConversationId: namedTool.conversationId,
+      selectedSession: {
+        ...namedTool,
+        activeTool: {
+          ...namedTool.activeTool,
+          elapsedSec: 9.2,
+          approvalHint: "工具耗时超 8 秒，若宿主弹出了权限确认框请先处理",
+        },
+      },
+      sessions: namedSessions,
+    }),
+    generatedAtIso: "2026-11-22T00:05:15Z",
+  },
+});
+await flushMicrotasks();
+assert.notEqual(appRoot.children[0], containerBefore12, "12c FAIL: approvalHint appearing did not rebuild DOM");
+assert.ok(renderedText().includes("审批提示：工具耗时超 8 秒"), "12c FAIL: approvalHint banner missing");
+
+// 12d. Code-point safe truncation avoids splitting surrogate-pair emojis
+const emojiSess = makeSessionItem("cid-emj0-4444", "Check emoji clipping", null, {
+  workspaceName: "repo-emj",
+  conversationName: "🚀".repeat(25),
+});
+sendHostNotification("ui/notifications/tool-input", { arguments: {} });
+await flushMicrotasks();
+sendHostNotification("ui/notifications/tool-result", {
+  content: [{ type: "text", text: "emoji bind" }],
+  structuredContent: makePayload({
+    bindingMode: "hook_bound",
+    boundConversationId: emojiSess.conversationId,
+    selectedSession: emojiSess,
+    sessions: [emojiSess],
+  }),
+});
+await flushMicrotasks();
+const emojiPillText = appRoot.findAll(
+  (n) => typeof n.className === "string" && n.className.includes("ns-bind-pill"),
+)[0].textContent;
+assert.ok(!/[\uD800-\uDFFF]/.test(emojiPillText) || [...emojiPillText].every((ch) => (ch.codePointAt(0) ?? 0) > 0xffff || !/[\uD800-\uDFFF]/.test(ch)), "12d FAIL: Lone surrogate emitted");
+assert.ok(!emojiPillText.includes("\uFFFD"), "12d FAIL: Replacement char emitted in truncated emoji label");
+assert.ok(emojiPillText.includes("#cid-emj0"), "12d FAIL: #shortId missing on emoji pill");
+console.log("[PASS] 12. Conversation name displays in front across UI, fallback intact, & TOOL_RUNNING elapsedSec skips rebuild cleanly");
 
 console.log(`ALL SIDE PANEL BUNDLE CHECKS PASSED (total RPC calls=${recordedToolCalls.length}, maxConcurrent=${maxConcurrentRpc})`);
