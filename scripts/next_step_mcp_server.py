@@ -14,11 +14,9 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import next_step_core as core  # noqa: E402
-import next_step_floating  # noqa: E402
-import next_step_hud_server as hud_server  # noqa: E402
 
 SERVER_NAME = "next-step"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
 SUPPORTED_PROTOCOL_VERSIONS = {
     "2024-11-05",
     "2025-03-26",
@@ -91,7 +89,7 @@ TOOLS: list[dict[str, Any]] = [
         "name": "next_step_get",
         "description": (
             "Query the current 'Next Step' status (next action, actor, waiting_on_user, source credibility, "
-            "and plan staleness) for a specific conversation or all active conversations, and ensure the local read-only HUD is accessible."
+            "and plan staleness) for a specific conversation or all active conversations as read-only Markdown."
         ),
         "inputSchema": {
             "type": "object",
@@ -103,16 +101,6 @@ TOOLS: list[dict[str, Any]] = [
                 "workspace_path": {
                     "type": "string",
                     "description": "Optional workspace path filter.",
-                },
-                "ensure_hud": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Start or verify the local 127.0.0.1 SSE HUD server and return its URL.",
-                },
-                "open_window": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Open or surface the macOS native always-on-top non-activating floating HUD window.",
                 },
             },
         },
@@ -238,13 +226,18 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 "isError": True,
             }
 
-        ensure_hud = args.get("_ensure_hud", True)
-        hud_info = hud_server.ensure_hud_server_running() if ensure_hud else {"url": f"file://{core.SNAPSHOT_HTML_PATH}"}
-        cid = (
-            str(state.get("conversationId"))
-            if isinstance(state, dict) and state.get("conversationId")
-            else str(core.clean_arg(args.get("_sys_conversation_id") or args.get("conversation_id") or "pending-hook-claim"))
-        )
+        if state is None:
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Next Step error: 未发布下一步指令——缺少会话归属（需由宿主 Hook 绑定当前会话或显式传入 `conversation_id`，本次未执行任何写入）。",
+                    }
+                ],
+                "isError": True,
+            }
+
+        cid = str(state.get("conversationId") or "")
         actor_label = core.format_actor_label(decl.get("actor"), bool(decl.get("waiting_on_user")))
         wait_label = "🔴 等我处理/确认" if decl.get("waiting_on_user") else "🟢 Agent 继续/后台执行"
         plan = decl.get("planArtifact")
@@ -261,67 +254,28 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             f"- **由谁做**：`{actor_label}`\n"
             f"- **接下来要做什么**：**{decl['next_action']}**"
             f"{plan_line}{prompt_line}\n"
-            f"- **HUD 面板**：{hud_info.get('url')} （静态快照：`{core.SNAPSHOT_HTML_PATH}`）"
+            "- **侧边面板**：可在 Antigravity 侧边栏打开 `Next Step HUD` 或调用 `next_step_side_panel` 查看"
         )
         return {"content": [{"type": "text", "text": text}], "isError": False}
 
     if name == "next_step_get":
-        cid = str(core.clean_arg(args.get("conversation_id") or args.get("_sys_conversation_id") or "")).strip() or None
+        explicit_cid = str(core.clean_arg(args.get("conversation_id") or "")).strip() or None
+        sys_cid = str(core.clean_arg(args.get("_sys_conversation_id") or "")).strip() or None
+        target_cid = explicit_cid or sys_cid
         ws_path = str(core.clean_arg(args.get("workspace_path") or "")).strip() or None
-        raw_ensure = core.clean_arg(args.get("ensure_hud"))
-        ensure_hud = True if raw_ensure is None else bool(raw_ensure)
-        raw_open_win = core.clean_arg(args.get("open_window"))
-        open_window = bool(raw_open_win) if raw_open_win is not None else False
 
-        hud_info = (
-            hud_server.ensure_hud_server_running()
-            if ensure_hud
-            else {"ok": False, "url": f"file://{core.SNAPSHOT_HTML_PATH}"}
-        )
-
-        floating_line = ""
-        if open_window and ensure_hud:
-            win_res = next_step_floating.launch_floating_hud(
-                url=str(hud_info.get("url") or "") if hud_info.get("ok") else None,
-                compact=True,
+        if target_cid:
+            raw_match, ambiguous, _ = core.resolve_target_session(
+                target_cid,
+                allow_prefix=bool(explicit_cid),
+                workspace_filter=ws_path,
             )
-            if win_res.get("ok"):
-                state_tag = "已置顶唤醒" if win_res.get("alreadyRunning") else "已打开悬浮窗"
-                floating_line = f"**原生悬浮窗**：`{state_tag}` (PID `{win_res.get('pid')}`, {win_res.get('url')})"
+            if raw_match is not None:
+                body = core.format_session_markdown(raw_match)
+            elif ambiguous:
+                body = f"会话前缀 `{target_cid}` 匹配多个会话，请提供完整 `conversation_id`（不自动猜测单一会话）。"
             else:
-                floating_line = (
-                    f"**原生悬浮窗启动失败**：`{win_res.get('error', 'unknown')}`"
-                    f"（请回退访问 {hud_info.get('url')}）"
-                )
-
-        header_lines = [
-            f"**Next Step HUD 地址**：{hud_info.get('url')}",
-            f"**精简悬浮视图**：{str(hud_info.get('url') or '').rstrip('/')}/?mode=compact"
-            if str(hud_info.get("url") or "").startswith("http")
-            else f"**静态 HTML 快照**：`{core.SNAPSHOT_HTML_PATH}`",
-            f"**静态 HTML 快照**：`{core.SNAPSHOT_HTML_PATH}`",
-            f"**Markdown 快照**：`{core.LATEST_MD_PATH}`",
-        ]
-        if floating_line:
-            header_lines.append(floating_line)
-        header_lines.append("")
-
-        if cid:
-            sp = core.session_path(cid)
-            if not sp.is_file():
-                # Fallback prefix match by shortId
-                matches = [
-                    s
-                    for s in core.list_all_sessions(workspace_filter=ws_path)
-                    if str(s.get("conversationId") or "").startswith(cid)
-                ]
-                if matches:
-                    body = "\n\n".join(core.format_session_markdown(m) for m in matches)
-                else:
-                    body = f"未找到会话 `{cid}` 的状态记录（该会话尚未触发 Hook 或发布下一步）。"
-            else:
-                state = core.load_session(cid)
-                body = core.format_session_markdown(state)
+                body = f"未找到会话 `{target_cid}` 的状态记录（该会话尚未触发 Hook 或发布下一步）。"
         else:
             sessions = core.list_all_sessions(workspace_filter=ws_path)
             if not sessions:
@@ -330,7 +284,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
                 body = "\n\n".join(core.format_session_markdown(s) for s in sessions[:10])
 
         return {
-            "content": [{"type": "text", "text": "\n".join(header_lines) + body}],
+            "content": [{"type": "text", "text": body}],
             "isError": False,
         }
 
@@ -353,6 +307,7 @@ def _handle_tool_call(name: str, args: dict[str, Any]) -> dict[str, Any]:
             bound_cid=target_cid,
             binding_mode=binding_mode,
             workspace_filter=ws_path,
+            allow_prefix=(False if name == "next_step_panel_state" else (binding_mode != "hook_bound")),
         )
         return {
             "content": [{"type": "text", "text": core.format_side_panel_text(payload)}],
@@ -478,14 +433,6 @@ def _dispatch(req: dict[str, Any]) -> dict[str, Any] | None:
 
 def main() -> None:
     core.ensure_data_dirs()
-    try:
-        next_step_floating.ensure_floating_hud_auto_started(
-            data_dir=core.DATA_DIR,
-            clear_dismiss=True,
-            reason="mcp_start",
-        )
-    except Exception as exc:
-        core.append_error_log("mcp_auto_start_floating_hud", exc)
     while True:
         try:
             req, framing = _read_message()

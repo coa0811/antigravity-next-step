@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
@@ -18,6 +19,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import next_step_core as core  # noqa: E402
 
 INLINE_TAG_RE = re.compile(r"<!--\s*NEXT_STEP:\s*(\{.*?\})\s*-->", re.DOTALL)
+TRANSCRIPT_INITIAL_TAIL_BYTES = 131072
 
 
 def _resolve_transcript_path(payload: dict[str, Any], state: dict[str, Any]) -> Path | None:
@@ -45,24 +47,44 @@ def _resolve_transcript_path(payload: dict[str, Any], state: dict[str, Any]) -> 
 
 
 def _load_transcript_steps(payload: dict[str, Any], state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read only the recent tail window of transcript.jsonl containing the latest explicit user turn."""
     tr_path = _resolve_transcript_path(payload, state)
     if tr_path is None:
         return []
-    steps: list[dict[str, Any]] = []
     try:
-        for line in tr_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            s = line.strip()
-            if not s:
-                continue
-            try:
-                obj = json.loads(s)
-                if isinstance(obj, dict):
-                    steps.append(obj)
-            except json.JSONDecodeError:
-                continue
+        with tr_path.open("rb") as fh:
+            file_size = fh.seek(0, os.SEEK_END)
+            if file_size <= 0:
+                return []
+            window = TRANSCRIPT_INITIAL_TAIL_BYTES
+            while True:
+                offset = max(0, file_size - window)
+                fh.seek(offset)
+                raw = fh.read(file_size - offset)
+                if offset > 0:
+                    nl = raw.find(b"\n")
+                    raw = raw[nl + 1 :] if nl >= 0 else b""
+                steps: list[dict[str, Any]] = []
+                for line in raw.decode("utf-8", errors="replace").splitlines():
+                    s = line.strip()
+                    if not s:
+                        continue
+                    try:
+                        obj = json.loads(s)
+                        if isinstance(obj, dict):
+                            steps.append(obj)
+                    except json.JSONDecodeError:
+                        continue
+                if offset == 0:
+                    return steps
+                for st in reversed(steps):
+                    if st.get("type") == "USER_INPUT" and st.get("source") == "USER_EXPLICIT":
+                        if "step_index" in st:
+                            return steps
+                        break
+                window *= 4
     except OSError:
         return []
-    return steps
 
 
 def _latest_user_step_index(steps: list[dict[str, Any]]) -> int:
@@ -144,25 +166,11 @@ def _summarize_tool_call(tname: str, args: dict[str, Any]) -> str:
     return ""
 
 
-def _maybe_auto_start_floating_hud(reason: str) -> None:
-    try:
-        import next_step_floating  # local lazy import to keep PreToolUse/PostToolUse/Stop zero-overhead
-
-        next_step_floating.ensure_floating_hud_auto_started(
-            data_dir=core.DATA_DIR,
-            clear_dismiss=False,
-            reason=reason,
-        )
-    except Exception as exc:
-        core.append_error_log(f"hook_auto_start_floating_hud:{reason}", exc)
-
-
 def handle_session_start(payload: dict[str, Any]) -> dict[str, Any]:
     cid = str(payload.get("conversationId") or "default").strip() or "default"
     state = core.load_session(cid)
     core.update_common_metadata(state, payload)
     core.save_session(cid, state)
-    _maybe_auto_start_floating_hud("session_start")
     return {}
 
 
@@ -212,6 +220,7 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         state["pendingPlanReview"] = None
         state["planArtifact"] = None
         state["options"] = []
+        state["questions"] = []
         state["suggestedPrompt"] = None
         state["detail"] = None
         state["stale"] = False
@@ -232,19 +241,111 @@ def handle_pre_invocation(payload: dict[str, Any]) -> dict[str, Any]:
         state["nextAction"] = "Agent 正在思考与规划…"
 
     core.save_session(cid, state)
-    _maybe_auto_start_floating_hud("pre_invocation")
     return {}
 
 
-def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
-    cid = str(payload.get("conversationId") or "default").strip() or "default"
-    state = core.load_session(cid)
-    core.update_common_metadata(state, payload)
+def _strip_reserved_sys_args(d: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in d.items() if not str(k).startswith("_sys_")}
 
+
+def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_cid = str(payload.get("conversationId") or "").strip()
     tc = payload.get("toolCall") or {}
     tname = str(tc.get("name") or "").strip()
     raw_args = tc.get("args") or {}
     args = raw_args if isinstance(raw_args, dict) else {}
+    step_idx = int(payload.get("stepIdx") or 0)
+
+    is_pub, is_via_call_mcp, pub_args = _is_next_step_publish_call(tname, args)
+    if is_pub:
+        clean_pub_args = _strip_reserved_sys_args(pub_args)
+        if raw_cid:
+            state = core.load_session(raw_cid)
+            core.update_common_metadata(state, payload)
+            step_idx = int(payload.get("stepIdx") or state.get("stepIdx") or 0)
+            state["stepIdx"] = step_idx
+            ws_paths = state.get("workspacePaths") or []
+            art_dir = state.get("artifactDirectoryPath") or ""
+            core.stage_declaration(
+                clean_pub_args,
+                cid=raw_cid,
+                workspace_paths=ws_paths,
+                artifact_dir=art_dir or None,
+                step_idx=step_idx,
+                write_pending_buffer=True,
+            )
+            sys_inject: dict[str, Any] = {
+                "_sys_conversation_id": raw_cid,
+                "_sys_step_idx": step_idx,
+                "_sys_artifact_dir": art_dir,
+                "_sys_workspace_paths": ws_paths,
+            }
+        else:
+            ws_paths = [str(x) for x in (payload.get("workspacePaths") or []) if x]
+            art_dir = str(payload.get("artifactDirectoryPath") or "").strip()
+            core.stage_declaration(
+                clean_pub_args,
+                cid=None,
+                workspace_paths=ws_paths,
+                artifact_dir=art_dir or None,
+                step_idx=step_idx,
+                write_pending_buffer=False,
+            )
+            sys_inject = {"_sys_step_idx": step_idx}
+            if art_dir:
+                sys_inject["_sys_artifact_dir"] = art_dir
+            if ws_paths:
+                sys_inject["_sys_workspace_paths"] = ws_paths
+            if not is_via_call_mcp:
+                for k in args:
+                    if str(k).startswith("_sys_") and k not in sys_inject:
+                        sys_inject[k] = ""
+
+        if is_via_call_mcp:
+            return {
+                "decision": "allow",
+                "overwrite": {
+                    "Arguments": dict(clean_pub_args, **sys_inject),
+                },
+            }
+        return {
+            "decision": "allow",
+            "overwrite": sys_inject,
+        }
+
+    is_panel, is_panel_via_call_mcp, panel_args = _is_next_step_side_panel_call(tname, args)
+    if is_panel:
+        clean_panel_args = _strip_reserved_sys_args(panel_args)
+        if raw_cid:
+            state = core.load_session(raw_cid)
+            core.update_common_metadata(state, payload)
+            sys_inject_panel: dict[str, Any] = {
+                "_sys_conversation_id": raw_cid,
+                "_sys_workspace_paths": state.get("workspacePaths") or [],
+            }
+        else:
+            ws_paths = [str(x) for x in (payload.get("workspacePaths") or []) if x]
+            sys_inject_panel = {"_sys_workspace_paths": ws_paths} if ws_paths else {}
+            if not is_panel_via_call_mcp:
+                for k in args:
+                    if str(k).startswith("_sys_") and k not in sys_inject_panel:
+                        sys_inject_panel[k] = ""
+
+        if is_panel_via_call_mcp:
+            return {
+                "decision": "allow",
+                "overwrite": {
+                    "Arguments": dict(clean_panel_args, **sys_inject_panel),
+                },
+            }
+        return {
+            "decision": "allow",
+            "overwrite": sys_inject_panel,
+        }
+
+    cid = raw_cid or "default"
+    state = core.load_session(cid)
+    core.update_common_metadata(state, payload)
     step_idx = int(payload.get("stepIdx") or state.get("stepIdx") or 0)
     state["stepIdx"] = step_idx
 
@@ -252,19 +353,40 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
 
     if low == "ask_question":
         questions = core.clean_arg(args.get("questions"))
+        parsed_questions: list[dict[str, Any]] = []
+        if isinstance(questions, list):
+            for raw_item in questions:
+                q_obj = core.clean_arg(raw_item)
+                if not isinstance(q_obj, dict):
+                    continue
+                raw_q = str(core.clean_arg(q_obj.get("question") or "")).strip()
+                raw_opts = core.clean_arg(q_obj.get("options") or [])
+                q_opts_i: list[str] = (
+                    [str(core.clean_arg(o)) for o in raw_opts if o is not None]
+                    if isinstance(raw_opts, list)
+                    else []
+                )
+                title = raw_q or (f"问题 {len(parsed_questions) + 1}" if len(questions) > 1 else "请回答 Agent 提出的问题")
+                parsed_questions.append(
+                    {
+                        "question": title,
+                        "options": q_opts_i,
+                        "multiSelect": bool(core.clean_arg(q_obj.get("is_multi_select", False))),
+                    }
+                )
+
         q_text = "请回答 Agent 提出的问题"
         q_opts: list[str] = []
-        if isinstance(questions, list) and questions:
-            first_q = core.clean_arg(questions[0])
-            if isinstance(first_q, dict):
-                raw_q = str(core.clean_arg(first_q.get("question") or "")).strip()
-                if raw_q:
-                    q_text = raw_q
-                raw_opts = core.clean_arg(first_q.get("options") or [])
-                if isinstance(raw_opts, list):
-                    q_opts = [str(core.clean_arg(o)) for o in raw_opts if o is not None]
-            if len(questions) > 1:
-                q_text = f"{q_text}（共 {len(questions)} 个问题）"
+        if len(parsed_questions) == 1:
+            q_text = parsed_questions[0]["question"]
+            q_opts = parsed_questions[0]["options"]
+        elif len(parsed_questions) > 1:
+            q_text = f"{parsed_questions[0]['question']}（共 {len(parsed_questions)} 个问题）"
+            q_opts = [
+                f"[Q{idx}] {opt}"
+                for idx, pq in enumerate(parsed_questions, 1)
+                for opt in pq["options"]
+            ]
 
         state["lifecycle"] = "WAITING_USER_DECISION"
         state["sourceType"] = "APPROVAL_REQUIRED"
@@ -274,6 +396,7 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         state["nextAction"] = f"在聊天框回答选择题：{q_text}"
         state["detail"] = None
         state["options"] = q_opts
+        state["questions"] = parsed_questions
         state["suggestedPrompt"] = None
         state["activeTool"] = None
         state["stale"] = False
@@ -295,58 +418,13 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         state["nextAction"] = f"审批权限请求：{action}{target_part}"
         state["detail"] = reason or None
         state["options"] = []
+        state["questions"] = []
         state["suggestedPrompt"] = None
         state["activeTool"] = None
         state["stale"] = False
         state["staleReason"] = None
         core.save_session(cid, state)
         return {"decision": "allow"}
-
-    is_pub, is_via_call_mcp, pub_args = _is_next_step_publish_call(tname, args)
-    if is_pub:
-        core.stage_declaration(
-            pub_args,
-            cid=cid,
-            workspace_paths=state.get("workspacePaths") or [],
-            artifact_dir=state.get("artifactDirectoryPath") or None,
-            step_idx=step_idx,
-            write_pending_buffer=True,
-        )
-        sys_inject = {
-            "_sys_conversation_id": cid,
-            "_sys_step_idx": step_idx,
-            "_sys_artifact_dir": state.get("artifactDirectoryPath") or "",
-            "_sys_workspace_paths": state.get("workspacePaths") or [],
-        }
-        if is_via_call_mcp:
-            return {
-                "decision": "allow",
-                "overwrite": {
-                    "Arguments": dict(pub_args, **sys_inject),
-                },
-            }
-        return {
-            "decision": "allow",
-            "overwrite": sys_inject,
-        }
-
-    is_panel, is_panel_via_call_mcp, panel_args = _is_next_step_side_panel_call(tname, args)
-    if is_panel:
-        sys_inject_panel = {
-            "_sys_conversation_id": cid,
-            "_sys_workspace_paths": state.get("workspacePaths") or [],
-        }
-        if is_panel_via_call_mcp:
-            return {
-                "decision": "allow",
-                "overwrite": {
-                    "Arguments": dict(panel_args, **sys_inject_panel),
-                },
-            }
-        return {
-            "decision": "allow",
-            "overwrite": sys_inject_panel,
-        }
 
     tool_summary = _summarize_tool_call(tname, args)
     now = time.time()
@@ -369,16 +447,32 @@ def handle_pre_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def handle_post_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
-    cid = str(payload.get("conversationId") or "default").strip() or "default"
-    state = core.load_session(cid)
-    core.update_common_metadata(state, payload)
-
+    raw_cid = str(payload.get("conversationId") or "").strip()
     tc = payload.get("toolCall") or {}
     tname = str(tc.get("name") or "").strip()
     raw_args = tc.get("args") or {}
     args = raw_args if isinstance(raw_args, dict) else {}
-    step_idx = int(payload.get("stepIdx") or state.get("stepIdx") or 0)
     error = str(payload.get("error") or "").strip()
+
+    is_panel, _, _ = _is_next_step_side_panel_call(tname, args)
+    if is_panel:
+        return {}
+
+    is_pub, _, pub_args = _is_next_step_publish_call(tname, args)
+    clean_pub_args = _strip_reserved_sys_args(pub_args) if is_pub else {}
+    if is_pub and not raw_cid:
+        explicit_cid = str(
+            core.clean_arg(clean_pub_args.get("conversation_id") or clean_pub_args.get("conversationId") or "")
+        ).strip()
+        if not explicit_cid:
+            return {}
+        cid = explicit_cid
+    else:
+        cid = raw_cid or "default"
+
+    state = core.load_session(cid)
+    core.update_common_metadata(state, payload)
+    step_idx = int(payload.get("stepIdx") or state.get("stepIdx") or 0)
 
     state["stepIdx"] = step_idx
     state["activeTool"] = None
@@ -392,11 +486,11 @@ def handle_post_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
         state["actor"] = "agent"
         state["nextAction"] = "已收到用户决定，Agent 继续执行中…"
         state["options"] = []
+        state["questions"] = []
         state["detail"] = None
         core.save_session(cid, state)
         return {}
 
-    is_pub, _, pub_args = _is_next_step_publish_call(tname, args)
     if is_pub:
         core.clear_pending_buffer(cid)
         if error:
@@ -407,14 +501,14 @@ def handle_post_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
             return {}
 
         decl, _ = core.stage_declaration(
-            pub_args,
+            clean_pub_args,
             cid=cid,
             workspace_paths=state.get("workspacePaths") or [],
             artifact_dir=state.get("artifactDirectoryPath") or None,
             step_idx=step_idx,
             write_pending_buffer=False,
         )
-        if decl is None:
+        if decl is None and raw_cid:
             claimed = core.claim_latest_pending_declaration(
                 cid,
                 min_created_at=float(state.get("turnStartedAt") or 0.0),
@@ -423,10 +517,6 @@ def handle_post_tool_use(payload: dict[str, Any]) -> dict[str, Any]:
                 state["pendingDeclaration"] = claimed
                 state["planArtifact"] = claimed.get("planArtifact")
                 core.save_session(cid, state)
-        return {}
-
-    is_panel, _, _ = _is_next_step_side_panel_call(tname, args)
-    if is_panel:
         return {}
 
     if low in core.MUTATING_FILE_TOOLS and not error:
@@ -552,6 +642,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
         state["nextAction"] = "当前回合已由用户手动中止，等待你输入新指令"
         state["detail"] = None
         state["options"] = []
+        state["questions"] = []
         state["suggestedPrompt"] = None
         state["stale"] = False
         state["staleReason"] = None
@@ -572,6 +663,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
         state["nextAction"] = f"执行异常中止（{err_desc}），请决定重试或调整指令"
         state["detail"] = error or None
         state["options"] = []
+        state["questions"] = []
         state["suggestedPrompt"] = None
         state["stale"] = False
         state["staleReason"] = None
@@ -636,6 +728,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
         state["nextAction"] = "主回合已暂停，正在等待后台任务或子 Agent 完成"
         state["detail"] = None
         state["options"] = []
+        state["questions"] = []
         state["suggestedPrompt"] = None
         state["stale"] = False
         state["staleReason"] = None
@@ -651,6 +744,7 @@ def handle_stop(payload: dict[str, Any]) -> dict[str, Any]:
     state["nextAction"] = None
     state["detail"] = None
     state["options"] = []
+    state["questions"] = []
     state["suggestedPrompt"] = None
     state["stale"] = False
     state["staleReason"] = None

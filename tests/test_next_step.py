@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import io
 import json
 import os
@@ -12,10 +11,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unittest
-import urllib.request
 from pathlib import Path
 from unittest import mock
 
@@ -24,16 +21,12 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import next_step_core as core  # noqa: E402
-import next_step_floating  # noqa: E402
 import next_step_hook as hook  # noqa: E402
-import next_step_hud_server as hud_server  # noqa: E402
 import next_step_mcp_server as mcp_server  # noqa: E402
 
 
 class NextStepPluginTest(unittest.TestCase):
     def setUp(self) -> None:
-        self._prev_no_auto = os.environ.get("NEXT_STEP_NO_AUTO_FLOATING_HUD")
-        os.environ["NEXT_STEP_NO_AUTO_FLOATING_HUD"] = "1"
         self._tmp_data = tempfile.TemporaryDirectory()
         self._tmp_ws = tempfile.TemporaryDirectory()
         self._tmp_art = tempfile.TemporaryDirectory()
@@ -44,10 +37,6 @@ class NextStepPluginTest(unittest.TestCase):
         core.ensure_data_dirs()
 
     def tearDown(self) -> None:
-        if self._prev_no_auto is None:
-            os.environ.pop("NEXT_STEP_NO_AUTO_FLOATING_HUD", None)
-        else:
-            os.environ["NEXT_STEP_NO_AUTO_FLOATING_HUD"] = self._prev_no_auto
         self._tmp_art.cleanup()
         self._tmp_ws.cleanup()
         self._tmp_data.cleanup()
@@ -95,8 +84,8 @@ class NextStepPluginTest(unittest.TestCase):
         self.assertEqual(pre_out["decision"], "allow")
         self.assertEqual(pre_out["overwrite"]["_sys_conversation_id"], cid)
 
-        # 3. MCP server executes next_step_publish (with _ensure_hud=False to avoid spawning external daemon in unit test)
-        mcp_args = dict(pub_args, **pre_out["overwrite"], _ensure_hud=False)
+        # 3. MCP server executes next_step_publish
+        mcp_args = dict(pub_args, **pre_out["overwrite"])
         mcp_res = mcp_server._handle_tool_call("next_step_publish", mcp_args)
         self.assertFalse(mcp_res["isError"])
         self.assertIn("确认 generate_pdf.py 页边距改动", mcp_res["content"][0]["text"])
@@ -405,21 +394,25 @@ class NextStepPluginTest(unittest.TestCase):
         self.assertEqual(st_bg["actor"], "agent_background")
         self.assertFalse(st_bg["waitingOnUser"])
 
-    def test_mcp_dispatch_and_in_process_hud_server(self) -> None:
-        """Verify MCP JSON-RPC initialize/tools/call and HTTP HUD server endpoints (/healthz, /api/sessions, /)."""
+    def test_mcp_dispatch_publish_and_get_markdown(self) -> None:
+        """Verify MCP JSON-RPC initialize/tools/call for next_step_publish and next_step_get Markdown without daemons."""
         init_resp = mcp_server._dispatch(
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-03-26"}}
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2026-01-26"}}
         )
         self.assertIsNotNone(init_resp)
         self.assertEqual(init_resp["result"]["serverInfo"]["name"], "next-step")
+        self.assertEqual(init_resp["result"]["serverInfo"]["version"], "0.4.0")
         self.assertIn("resources", init_resp["result"]["capabilities"])
 
         list_resp = mcp_server._dispatch({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-        tool_names = {t["name"] for t in list_resp["result"]["tools"]}
+        tools_by_name = {t["name"]: t for t in list_resp["result"]["tools"]}
         self.assertEqual(
-            tool_names,
+            set(tools_by_name),
             {"next_step_publish", "next_step_get", "next_step_side_panel", "next_step_panel_state"},
         )
+        get_props = tools_by_name["next_step_get"]["inputSchema"]["properties"]
+        self.assertNotIn("ensure_hud", get_props)
+        self.assertNotIn("open_window", get_props)
 
         cid = "hud-test-session-12345678"
         hook.handle_pre_invocation(self._base_payload(cid, invocationNum=1))
@@ -432,16 +425,18 @@ class NextStepPluginTest(unittest.TestCase):
                     "name": "next_step_publish",
                     "arguments": {
                         "conversation_id": cid,
-                        "next_action": "在 HUD 中验证会话卡片渲染",
+                        "next_action": "在 Side Panel 中验证会话状态渲染",
                         "actor": "user",
                         "waiting_on_user": True,
                         "suggested_prompt": "验证通过，继续下一步",
-                        "_ensure_hud": False,
                     },
                 },
             }
         )
         self.assertFalse(call_resp["result"]["isError"])
+        pub_text = call_resp["result"]["content"][0]["text"]
+        self.assertIn("next_step_side_panel", pub_text)
+        self.assertNotIn("127.0.0.1", pub_text)
 
         get_resp = mcp_server._dispatch(
             {
@@ -450,32 +445,15 @@ class NextStepPluginTest(unittest.TestCase):
                 "method": "tools/call",
                 "params": {
                     "name": "next_step_get",
-                    "arguments": {"conversation_id": cid, "ensure_hud": False},
+                    "arguments": {"conversation_id": cid},
                 },
             }
         )
         self.assertFalse(get_resp["result"]["isError"])
-        self.assertIn("在 HUD 中验证会话卡片渲染", get_resp["result"]["content"][0]["text"])
-
-        httpd, thread, url = hud_server.start_in_process_server(host="127.0.0.1", port=0)
-        try:
-            with urllib.request.urlopen(url + "healthz", timeout=2.0) as r:
-                health = json.loads(r.read().decode("utf-8"))
-                self.assertTrue(health["ok"])
-
-            with urllib.request.urlopen(url + "api/sessions", timeout=2.0) as r:
-                api_data = json.loads(r.read().decode("utf-8"))
-                self.assertTrue(api_data["ok"])
-                self.assertEqual(len(api_data["sessions"]), 1)
-                self.assertEqual(api_data["sessions"][0]["nextAction"], "在 HUD 中验证会话卡片渲染")
-
-            with urllib.request.urlopen(url, timeout=2.0) as r:
-                html_body = r.read().decode("utf-8")
-                self.assertIn("Next Step HUD", html_body)
-                self.assertIn("在 HUD 中验证会话卡片渲染", html_body)
-                self.assertIn("复制指令", html_body)
-        finally:
-            hud_server.stop_in_process_server(httpd, thread)
+        get_text = get_resp["result"]["content"][0]["text"]
+        self.assertIn("在 Side Panel 中验证会话状态渲染", get_text)
+        self.assertIn("验证通过，继续下一步", get_text)
+        self.assertNotIn("127.0.0.1", get_text)
 
     def test_statusline_companion_script(self) -> None:
         """Verify CLI statusline.sh script formats waiting and declared states properly."""
@@ -534,7 +512,6 @@ class NextStepPluginTest(unittest.TestCase):
                 "next_action": "仅属于会话 A 的下一步指令",
                 "actor": "user",
                 "waiting_on_user": True,
-                "_ensure_hud": False,
             },
         )
         hook.handle_post_tool_use(self._base_payload(cid_a, stepIdx=3, toolCall=wrapped_tc))
@@ -714,7 +691,6 @@ class NextStepPluginTest(unittest.TestCase):
                 "actor": "user",
                 "waiting_on_user": True,
                 "plan_path": str(plan_file),
-                "_ensure_hud": False,
             },
         )
         plan_file.write_text("# Plan v3 modified\n", encoding="utf-8")
@@ -727,7 +703,6 @@ class NextStepPluginTest(unittest.TestCase):
                 "next_action": "改为无需计划的独立检查",
                 "actor": "user",
                 "waiting_on_user": True,
-                "_ensure_hud": False,
             },
         )
         hook.handle_stop(self._base_payload(cid, lastUserInput="第三轮同轮替换", terminationReason="NO_TOOL_CALL", fullyIdle=True))
@@ -892,408 +867,6 @@ class NextStepPluginTest(unittest.TestCase):
         self.assertTrue(st_deleted["stale"])
         self.assertTrue(st_deleted["planArtifact"]["stale"])
 
-    def test_compact_hud_route_and_webkit_clipboard_bridge(self) -> None:
-        """Verify /?mode=compact renders compact floating mode, option copy chips, WebKit clipboard bridge, and /healthz version."""
-        cid = "compact-hud-test-001"
-        hook.handle_pre_invocation(self._base_payload(cid, invocationNum=1, lastUserInput="选一个入口"))
-        hook.handle_pre_tool_use(
-            self._base_payload(
-                cid,
-                stepIdx=2,
-                lastUserInput="选一个入口",
-                toolCall={
-                    "id": "tc_q",
-                    "name": "ask_question",
-                    "args": {
-                        "questions": [
-                            {
-                                "question": "请选择执行目标",
-                                "options": ["方案 A", "方案 B"],
-                            }
-                        ]
-                    },
-                },
-            )
-        )
-
-        httpd, thread, url = hud_server.start_in_process_server(host="127.0.0.1", port=0)
-        try:
-            with urllib.request.urlopen(url + "healthz", timeout=2.0) as r:
-                health = json.loads(r.read().decode("utf-8"))
-                self.assertEqual(health.get("version"), hud_server.HUD_SERVER_VERSION)
-
-            with urllib.request.urlopen(url + "?mode=compact", timeout=2.0) as r:
-                compact_html = r.read().decode("utf-8")
-                self.assertIn('class="mode-compact"', compact_html)
-                self.assertIn("window.webkit.messageHandlers.copyText", compact_html)
-                self.assertIn("copyOption", compact_html)
-                self.assertIn("copyPrompt", compact_html)
-                self.assertIn("方案 A", compact_html)
-        finally:
-            hud_server.stop_in_process_server(httpd, thread)
-
-    def test_floating_hud_swift_compiles_cleanly(self) -> None:
-        """Verify floating_hud.swift compiles cleanly via swiftc and caches binary by SHA-256."""
-        if next_step_floating.find_swiftc() is None:
-            self.skipTest("swiftc not available in environment")
-
-        t0 = time.time()
-        bin_path = next_step_floating.compile_floating_hud(self.data_dir)
-        self.assertTrue(bin_path.is_file())
-        self.assertTrue(os.access(bin_path, os.X_OK))
-        mtime_1 = bin_path.stat().st_mtime_ns
-
-        # Second call hits SHA-256 cache without recompiling
-        bin_path_2 = next_step_floating.compile_floating_hud(self.data_dir)
-        self.assertEqual(bin_path, bin_path_2)
-        self.assertEqual(bin_path_2.stat().st_mtime_ns, mtime_1)
-        self.assertGreater(time.time() - t0, 0.0)
-
-        swift_src = next_step_floating.SWIFT_SOURCE_PATH.read_text(encoding="utf-8")
-        self.assertIn("NSWindow.contentRect(", swift_src)
-        self.assertIn("hudPanel.setFrame(initialFrame", swift_src)
-        self.assertIn("writeDismissFile()", swift_src)
-
-        usage_proc = subprocess.run([str(bin_path)], text=True, capture_output=True, timeout=5.0)
-        self.assertEqual(usage_proc.returncode, 2)
-        self.assertIn("--dismiss-file", usage_proc.stderr)
-
-    def test_floating_hud_pid_identity_and_stale_cleanup(self) -> None:
-        """[Round 1 P1 Regression] Unrelated live PID in floating_hud.json must never receive SIGUSR1/SIGTERM and is cleaned up."""
-        _, _, state_path, _ = next_step_floating._floating_paths(self.data_dir)
-        unrelated_pid = os.getpid()
-        state_path.write_text(
-            json.dumps({"pid": unrelated_pid, "url": "http://127.0.0.1:9999/?mode=full"}),
-            encoding="utf-8",
-        )
-        kill_calls: list[tuple[int, int]] = []
-        orig_kill = os.kill
-
-        def spy_kill(pid: int, sig: int) -> None:
-            kill_calls.append((pid, sig))
-            return orig_kill(pid, sig)
-
-        with mock.patch("os.kill", side_effect=spy_kill):
-            res = next_step_floating.is_floating_hud_running(self.data_dir)
-        self.assertIsNone(res)
-        self.assertFalse(state_path.exists())
-        self.assertTrue(all(sig == 0 for _, sig in kill_calls))
-
-        # Spoofed command lines containing substring in arguments must still be rejected
-        fake_bin = str(self.data_dir / "bin" / "next-step-floating-hud")
-        for spoof_comm, spoof_args in (
-            ("/usr/bin/tail", "/usr/bin/tail -f /tmp/next-step-floating-hud.log"),
-            ("/usr/bin/vim", f"/usr/bin/vim {fake_bin}"),
-            ("/usr/bin/python3", f"/usr/bin/python3 -c pass {fake_bin}"),
-        ):
-            with (
-                mock.patch.object(next_step_floating, "_is_pid_alive", return_value=True),
-                mock.patch.object(
-                    next_step_floating,
-                    "_query_ps_field",
-                    side_effect=lambda _pid, field, c=spoof_comm, a=spoof_args: c if field == "comm" else a,
-                ),
-            ):
-                self.assertFalse(next_step_floating._verify_floating_hud_process(99999, expected_executable=fake_bin))
-
-        # Spoofed HUD server command lines must also be rejected
-        hud_script = str(Path(hud_server.__file__).resolve())
-        for spoof_comm, spoof_args in (
-            ("/usr/bin/tail", f"/usr/bin/tail -f {hud_script}"),
-            ("/usr/local/bin/python3", f"/usr/local/bin/python3 -m http.server {hud_script}"),
-            ("/usr/local/bin/python3", f"/usr/local/bin/python3 /tmp/other.py --ref {hud_script}"),
-        ):
-            def fake_ps_run(cmd, **kwargs):
-                field = cmd[-1].rstrip("=")
-                out = spoof_comm if field == "comm" else spoof_args
-                return subprocess.CompletedProcess(cmd, 0, stdout=out + "\n", stderr="")
-
-            with mock.patch.object(hud_server.subprocess, "run", side_effect=fake_ps_run):
-                self.assertFalse(hud_server._verify_hud_server_process(99999))
-
-        # Genuine HUD server command line with matching script & data-dir must pass
-        def real_ps_run(cmd, **kwargs):
-            field = cmd[-1].rstrip("=")
-            out = (
-                "/usr/local/bin/python3"
-                if field == "comm"
-                else f"/usr/local/bin/python3 -u {hud_script} --host 127.0.0.1 --port 18765 --data-dir {self.data_dir}"
-            )
-            return subprocess.CompletedProcess(cmd, 0, stdout=out + "\n", stderr="")
-
-        with mock.patch.object(hud_server.subprocess, "run", side_effect=real_ps_run):
-            self.assertTrue(hud_server._verify_hud_server_process(99999))
-
-    def test_floating_hud_concurrent_launch_lock_single_instance(self) -> None:
-        """[Round 1 P2 Regression] Concurrent launch_floating_hud calls serialize via flock and only spawn once."""
-        bin_path = self.data_dir / "bin" / "next-step-floating-hud"
-        bin_path.parent.mkdir(parents=True, exist_ok=True)
-        bin_path.write_text("#!/bin/sh\n", encoding="utf-8")
-        _, _, state_path, _ = next_step_floating._floating_paths(self.data_dir)
-
-        spawn_count = 0
-        fake_pid = 424242
-
-        class FakeProc:
-            def __init__(self, pid: int) -> None:
-                self.pid = pid
-
-            def poll(self) -> None:
-                return None
-
-        def fake_popen(cmd, **kwargs):
-            nonlocal spawn_count
-            spawn_count += 1
-            time.sleep(0.15)
-            state_path.write_text(
-                json.dumps(
-                    {
-                        "pid": fake_pid,
-                        "url": "http://127.0.0.1:18765/?mode=compact",
-                        "executable": str(bin_path),
-                    }
-                ),
-                encoding="utf-8",
-            )
-            return FakeProc(fake_pid)
-
-        def fake_verify(pid: int, expected_executable: str | None = None) -> bool:
-            return pid == fake_pid and state_path.is_file()
-
-        results: list[dict] = []
-        results_lock = threading.Lock()
-
-        def worker() -> None:
-            r = next_step_floating.launch_floating_hud(
-                url="http://127.0.0.1:18765/",
-                compact=True,
-                data_dir=self.data_dir,
-            )
-            with results_lock:
-                results.append(r)
-
-        with (
-            mock.patch.object(next_step_floating, "compile_floating_hud", return_value=bin_path),
-            mock.patch.object(next_step_floating, "_verify_floating_hud_process", side_effect=fake_verify),
-            mock.patch("subprocess.Popen", side_effect=fake_popen),
-            mock.patch("os.kill") as mock_kill,
-        ):
-            t1 = threading.Thread(target=worker)
-            t2 = threading.Thread(target=worker)
-            t1.start()
-            t2.start()
-            t1.join(timeout=5.0)
-            t2.join(timeout=5.0)
-
-        self.assertEqual(spawn_count, 1)
-        self.assertEqual(len(results), 2)
-        self.assertTrue(all(r.get("ok") for r in results))
-        self.assertEqual(sorted(bool(r.get("alreadyRunning")) for r in results), [False, True])
-        mock_kill.assert_called_once()
-
-    def test_mcp_next_step_get_open_window_hook(self) -> None:
-        """Verify next_step_get(open_window=True) calls launch_floating_hud and formats status in response."""
-        fake_hud = {"ok": True, "url": "http://127.0.0.1:18765/", "port": 18765, "pid": 4321}
-        fake_win = {"ok": True, "alreadyRunning": False, "pid": 9876, "url": "http://127.0.0.1:18765/?mode=compact"}
-        with (
-            mock.patch.object(hud_server, "ensure_hud_server_running", return_value=fake_hud),
-            mock.patch.object(next_step_floating, "launch_floating_hud", return_value=fake_win) as mock_launch,
-        ):
-            res = mcp_server._handle_tool_call("next_step_get", {"ensure_hud": True, "open_window": True})
-        self.assertFalse(res["isError"])
-        mock_launch.assert_called_once_with(url="http://127.0.0.1:18765/", compact=True)
-        txt = res["content"][0]["text"]
-        self.assertIn("已打开悬浮窗", txt)
-        self.assertIn("9876", txt)
-        self.assertIn("?mode=compact", txt)
-
-    def test_floating_hud_auto_start_hooks_and_dismiss_flow(self) -> None:
-        """Option A: SessionStart/PreInvocation trigger detached --auto, respect dismiss marker & lock, and never disturb active window."""
-        cid = "auto-start-flow-001"
-        spawned_calls: list[tuple[list[str], dict]] = []
-
-        class FakeProc:
-            def __init__(self, pid: int) -> None:
-                self.pid = pid
-
-            def poll(self) -> None:
-                return None
-
-        def fake_popen(cmd, **kwargs):
-            spawned_calls.append((list(cmd), dict(kwargs)))
-            return FakeProc(70000 + len(spawned_calls))
-
-        with (
-            mock.patch.dict(os.environ, {"NEXT_STEP_NO_AUTO_FLOATING_HUD": ""}, clear=False),
-            mock.patch.object(next_step_floating.sys, "platform", "darwin"),
-            mock.patch.object(next_step_floating.subprocess, "Popen", side_effect=fake_popen),
-        ):
-            # 1. SessionStart triggers detached --auto launch
-            hook.handle_session_start(self._base_payload(cid))
-            self.assertEqual(len(spawned_calls), 1)
-            cmd1, kw1 = spawned_calls[0]
-            self.assertEqual(Path(cmd1[1]).resolve(), Path(next_step_floating.__file__).resolve())
-            self.assertIn("--auto", cmd1)
-            self.assertIn("--data-dir", cmd1)
-            self.assertEqual(cmd1[cmd1.index("--data-dir") + 1], str(self.data_dir))
-            self.assertEqual(kw1["stdin"], subprocess.DEVNULL)
-            self.assertEqual(kw1["stdout"], subprocess.DEVNULL)
-            self.assertEqual(kw1["stderr"], subprocess.DEVNULL)
-            self.assertTrue(kw1["close_fds"])
-            self.assertTrue(kw1["start_new_session"])
-
-            # 2. PreInvocation also triggers detached --auto when neither running nor dismissed
-            hook.handle_pre_invocation(self._base_payload(cid, invocationNum=1))
-            self.assertEqual(len(spawned_calls), 2)
-
-            # 3. Manual close writes dismiss marker -> hooks & launch_floating_hud(respect_dismiss=True) must skip
-            dismiss_path = next_step_floating.dismiss_marker_path(self.data_dir)
-            dismiss_path.write_text(json.dumps({"dismissedAt": time.time(), "pid": 123, "reason": "window_closed"}), encoding="utf-8")
-
-            hook.handle_session_start(self._base_payload(cid))
-            hook.handle_pre_invocation(self._base_payload(cid, invocationNum=2))
-            self.assertEqual(len(spawned_calls), 2)
-
-            auto_res = next_step_floating.launch_floating_hud(compact=True, data_dir=self.data_dir, respect_dismiss=True)
-            self.assertEqual(auto_res, {"ok": True, "skipped": True, "reason": "dismissed"})
-
-            # 4. MCP restart / clear_dismiss=True removes dismiss marker and spawns detached --auto
-            mcp_auto = next_step_floating.ensure_floating_hud_auto_started(
-                data_dir=self.data_dir,
-                clear_dismiss=True,
-                reason="mcp_start",
-            )
-            self.assertTrue(mcp_auto["ok"])
-            self.assertFalse(mcp_auto["skipped"])
-            self.assertTrue(mcp_auto["spawned"])
-            self.assertFalse(dismiss_path.exists())
-            self.assertEqual(len(spawned_calls), 3)
-
-            # 5. Held floating_hud.lock causes hook (clear_dismiss=False) to skip, while clear_dismiss=True still spawns
-            lock_path = self.data_dir / "floating_hud.lock"
-            with lock_path.open("a", encoding="utf-8") as held_fh:
-                fcntl.flock(held_fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                try:
-                    res_locked = next_step_floating.ensure_floating_hud_auto_started(
-                        data_dir=self.data_dir,
-                        clear_dismiss=False,
-                        reason="session_start",
-                    )
-                    self.assertEqual(res_locked, {"ok": True, "skipped": True, "reason": "launch_in_progress"})
-                    self.assertEqual(len(spawned_calls), 3)
-
-                    res_mcp_locked = next_step_floating.ensure_floating_hud_auto_started(
-                        data_dir=self.data_dir,
-                        clear_dismiss=True,
-                        reason="mcp_start",
-                    )
-                    self.assertTrue(res_mcp_locked["spawned"])
-                    self.assertEqual(len(spawned_calls), 4)
-                finally:
-                    fcntl.flock(held_fh.fileno(), fcntl.LOCK_UN)
-
-            # 6. Running --full window must NEVER be killed or signaled by auto-launch (even when auto wants compact)
-            running_full = {"pid": 54321, "url": "http://127.0.0.1:18765/", "executable": "fake"}
-            with (
-                mock.patch.object(next_step_floating, "is_floating_hud_running", return_value=running_full),
-                mock.patch("os.kill") as mock_kill,
-            ):
-                skip_running = next_step_floating.ensure_floating_hud_auto_started(
-                    data_dir=self.data_dir,
-                    clear_dismiss=False,
-                    reason="pre_invocation",
-                )
-                self.assertEqual(
-                    skip_running,
-                    {"ok": True, "skipped": True, "reason": "already_running", "pid": 54321},
-                )
-                respect_running = next_step_floating.launch_floating_hud(
-                    url="http://127.0.0.1:18765/",
-                    compact=True,
-                    data_dir=self.data_dir,
-                    respect_dismiss=True,
-                )
-                self.assertTrue(respect_running["ok"])
-                self.assertTrue(respect_running["alreadyRunning"])
-                self.assertEqual(respect_running["pid"], 54321)
-                self.assertEqual(respect_running["url"], "http://127.0.0.1:18765/")
-                mock_kill.assert_not_called()
-
-        # 7. Explicit launch (respect_dismiss=False) clears dismiss marker and passes --dismiss-file
-        bin_path = self.data_dir / "bin" / "next-step-floating-hud"
-        bin_path.parent.mkdir(parents=True, exist_ok=True)
-        bin_path.write_text("#!/bin/sh\n", encoding="utf-8")
-        _, _, state_path, _ = next_step_floating._floating_paths(self.data_dir)
-        dismiss_path = next_step_floating.dismiss_marker_path(self.data_dir)
-        dismiss_path.write_text(json.dumps({"dismissedAt": time.time(), "pid": 999, "reason": "window_closed"}), encoding="utf-8")
-        explicit_cmds: list[list[str]] = []
-
-        def fake_explicit_popen(cmd, **kwargs):
-            explicit_cmds.append(list(cmd))
-            state_path.write_text(
-                json.dumps(
-                    {
-                        "pid": 65432,
-                        "url": "http://127.0.0.1:18765/?mode=compact",
-                        "executable": str(bin_path),
-                    }
-                ),
-                encoding="utf-8",
-            )
-            return FakeProc(65432)
-
-        with (
-            mock.patch.object(next_step_floating, "compile_floating_hud", return_value=bin_path),
-            mock.patch.object(
-                next_step_floating,
-                "_verify_floating_hud_process",
-                side_effect=lambda pid, expected_executable=None: pid == 65432 and state_path.is_file(),
-            ),
-            mock.patch.object(next_step_floating.subprocess, "Popen", side_effect=fake_explicit_popen),
-        ):
-            res_exp = next_step_floating.launch_floating_hud(
-                url="http://127.0.0.1:18765/",
-                compact=True,
-                data_dir=self.data_dir,
-                respect_dismiss=False,
-            )
-        self.assertTrue(res_exp["ok"])
-        self.assertFalse(res_exp["alreadyRunning"])
-        self.assertFalse(dismiss_path.exists())
-        self.assertEqual(len(explicit_cmds), 1)
-        self.assertIn("--dismiss-file", explicit_cmds[0])
-        self.assertEqual(explicit_cmds[0][explicit_cmds[0].index("--dismiss-file") + 1], str(dismiss_path))
-
-    def test_mcp_server_main_triggers_non_blocking_auto_start(self) -> None:
-        """Verify mcp_server.main triggers non-blocking floating HUD auto-start once and never crashes on error."""
-        with (
-            mock.patch.object(mcp_server, "_read_message", return_value=(None, "jsonl")),
-            mock.patch.object(
-                mcp_server.next_step_floating,
-                "ensure_floating_hud_auto_started",
-                return_value={"ok": True, "spawned": True},
-            ) as mock_auto,
-        ):
-            mcp_server.main()
-        mock_auto.assert_called_once_with(
-            data_dir=core.DATA_DIR,
-            clear_dismiss=True,
-            reason="mcp_start",
-        )
-
-        # Error from auto-start helper must be caught, logged, and never crash MCP server main loop
-        with (
-            mock.patch.object(mcp_server, "_read_message", return_value=(None, "jsonl")),
-            mock.patch.object(
-                mcp_server.next_step_floating,
-                "ensure_floating_hud_auto_started",
-                side_effect=RuntimeError("boom"),
-            ),
-        ):
-            mcp_server.main()
-        self.assertTrue(core.ERROR_LOG_PATH.is_file())
-        self.assertIn("mcp_auto_start_floating_hud: boom", core.ERROR_LOG_PATH.read_text(encoding="utf-8"))
-
     def test_declared_next_step_survives_stop_hook_block_and_retry(self) -> None:
         """[P1 Regression] Explicit next_step_publish survives Stop-hook block + same-turn retry until a new user turn."""
         # Part 1: With transcript.jsonl tracking USER_EXPLICIT step
@@ -1324,7 +897,7 @@ class NextStepPluginTest(unittest.TestCase):
                 toolCall={"id": "tc_pub", "name": "mcp_next-step_next_step_publish", "args": pub_args},
             )
         )
-        mcp_server._handle_tool_call("next_step_publish", dict(pub_args, **pre_out["overwrite"], _ensure_hud=False))
+        mcp_server._handle_tool_call("next_step_publish", dict(pub_args, **pre_out["overwrite"]))
         hook.handle_post_tool_use(
             self._base_payload(
                 cid_tr,
@@ -1455,7 +1028,7 @@ class NextStepPluginTest(unittest.TestCase):
                 toolCall={"id": "tc_pub2", "name": "mcp_next-step_next_step_publish", "args": pub_no_tr},
             )
         )
-        mcp_server._handle_tool_call("next_step_publish", dict(pub_no_tr, **pre2["overwrite"], _ensure_hud=False))
+        mcp_server._handle_tool_call("next_step_publish", dict(pub_no_tr, **pre2["overwrite"]))
         hook.handle_post_tool_use(
             self._base_payload(
                 cid_no_tr,
@@ -1527,7 +1100,7 @@ class NextStepPluginTest(unittest.TestCase):
                 toolCall={"id": "tc_pub", "name": "mcp_next-step_next_step_publish", "args": pub_args},
             )
         )
-        mcp_server._handle_tool_call("next_step_publish", dict(pub_args, **pre_out["overwrite"], _ensure_hud=False))
+        mcp_server._handle_tool_call("next_step_publish", dict(pub_args, **pre_out["overwrite"]))
         hook.handle_post_tool_use(
             self._base_payload(
                 cid,
@@ -1565,9 +1138,9 @@ class NextStepPluginTest(unittest.TestCase):
         self.assertTrue(ev_mid["stale"])
         self.assertTrue(ev_mid["planArtifact"]["stale"])
 
-        html_compact = core.render_hud_html(compact=True)
-        self.assertIn("cur.planArtifact && cur.planArtifact.stale", html_compact)
-        self.assertIn("disabled title=", html_compact)
+        panel_mid = core.build_side_panel_payload(bound_cid=st_mid["conversationId"], binding_mode="hook_bound")
+        self.assertTrue(panel_mid["selectedSession"]["stale"])
+        self.assertTrue(panel_mid["selectedSession"]["copyBlocked"])
 
     def test_mcp_apps_protocol_resource_and_entrypoints(self) -> None:
         """Verify MCP Apps (SEP-1865 + Antigravity aux_pane) protocol: initialize, tools/_meta, resources/list, resources/read."""
@@ -1591,7 +1164,7 @@ class NextStepPluginTest(unittest.TestCase):
         self.assertIsNotNone(init_resp)
         res_init = init_resp["result"]
         self.assertEqual(res_init["protocolVersion"], "2026-01-26")
-        self.assertEqual(res_init["serverInfo"]["version"], "0.3.0")
+        self.assertEqual(res_init["serverInfo"]["version"], "0.4.0")
         self.assertIn("tools", res_init["capabilities"])
         self.assertIn("resources", res_init["capabilities"])
 
@@ -1689,7 +1262,7 @@ class NextStepPluginTest(unittest.TestCase):
                 toolCall={"id": "tc_pub_b", "name": "mcp_next-step_next_step_publish", "args": pub_b},
             )
         )
-        mcp_server._handle_tool_call("next_step_publish", dict(pub_b, **pre_b["overwrite"], _ensure_hud=False))
+        mcp_server._handle_tool_call("next_step_publish", dict(pub_b, **pre_b["overwrite"]))
         hook.handle_post_tool_use(
             self._base_payload(
                 cid_b,
@@ -1785,7 +1358,7 @@ class NextStepPluginTest(unittest.TestCase):
                 toolCall={"id": "tc_pub_long", "name": "mcp_next-step_next_step_publish", "args": pub_long},
             )
         )
-        mcp_server._handle_tool_call("next_step_publish", dict(pub_long, **pre_long["overwrite"], _ensure_hud=False))
+        mcp_server._handle_tool_call("next_step_publish", dict(pub_long, **pre_long["overwrite"]))
         hook.handle_post_tool_use(
             self._base_payload(
                 cid_long,
@@ -1822,6 +1395,509 @@ class NextStepPluginTest(unittest.TestCase):
             msg=f"verify_side_panel.mjs failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}",
         )
         self.assertIn("ALL SIDE PANEL BUNDLE CHECKS PASSED", proc.stdout)
+
+    def test_multi_question_ask_question_preserves_all_questions_and_options(self) -> None:
+        """Multi-question ask_question should preserve all questions/options and clear them on resolution."""
+        cid = "conv-multi-q"
+        hook.handle_pre_invocation(self._base_payload(cid, invocationNum=1, lastUserInput="configure db"))
+        hook.handle_pre_tool_use(
+            self._base_payload(
+                cid,
+                stepIdx=10,
+                toolCall={
+                    "id": "tc_multi_q",
+                    "name": "ask_question",
+                    "args": {
+                        "questions": [
+                            {
+                                "question": "Choose database engine?",
+                                "options": ["SQLite", "PostgreSQL"],
+                            },
+                            {
+                                "question": "Enable migration guard?",
+                                "options": ["Strict mode", "Skip check"],
+                            },
+                        ]
+                    },
+                },
+            )
+        )
+        st = core.load_session(cid)
+        self.assertEqual(st["lifecycle"], "WAITING_USER_DECISION")
+        self.assertEqual(st["sourceType"], "APPROVAL_REQUIRED")
+        self.assertTrue(st["waitingOnUser"])
+        self.assertEqual(len(st["questions"]), 2)
+        self.assertEqual(st["questions"][0]["options"], ["SQLite", "PostgreSQL"])
+        self.assertEqual(st["questions"][1]["options"], ["Strict mode", "Skip check"])
+        q_dump = json.dumps(st["questions"], ensure_ascii=False)
+        self.assertIn("Choose database engine?", q_dump)
+        self.assertIn("Enable migration guard?", q_dump)
+        joined_opts = "\n".join(st["options"])
+        self.assertIn("[Q1]", joined_opts)
+        self.assertIn("[Q2]", joined_opts)
+        self.assertIn("SQLite", joined_opts)
+        self.assertIn("Skip check", joined_opts)
+
+        md = core.format_session_markdown(st)
+        self.assertIn("Choose database engine?", md)
+        self.assertIn("Enable migration guard?", md)
+        self.assertIn("PostgreSQL", md)
+        self.assertIn("Strict mode", md)
+
+        panel = core.build_side_panel_payload(bound_cid=cid, binding_mode="hook_bound")
+        self.assertEqual(len(panel["selectedSession"]["questions"]), 2)
+        panel_text = core.format_side_panel_text(panel)
+        self.assertIn("Choose database engine?", panel_text)
+        self.assertIn("Enable migration guard?", panel_text)
+
+        hook.handle_post_tool_use(
+            self._base_payload(
+                cid,
+                stepIdx=10,
+                toolCall={"id": "tc_multi_q", "name": "ask_question", "args": {}},
+            )
+        )
+        st_cleared = core.load_session(cid)
+        self.assertEqual(st_cleared["questions"], [])
+        self.assertEqual(st_cleared["options"], [])
+        self.assertFalse(st_cleared["waitingOnUser"])
+
+    def test_transcript_tail_window_reverse_read_large_file(self) -> None:
+        """_load_transcript_steps should read from EOF tail window and expand for oversized trailing steps."""
+        self.assertEqual(hook.TRANSCRIPT_INITIAL_TAIL_BYTES, 131072)
+        cid = "conv-large-tr"
+        tr_dir = self.art_dir / ".system_generated" / "logs"
+        tr_dir.mkdir(parents=True, exist_ok=True)
+        tr_path = tr_dir / "transcript.jsonl"
+
+        early_pad = "X" * 600
+        lines = [
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "OLD_TURN"})
+        ]
+        lines.extend(
+            json.dumps({"step_index": i, "type": "PLANNER_RESPONSE", "content": f"EARLY_PADDING_{i:04d}_{early_pad}"})
+            for i in range(1, 595)
+        )
+        lines.append(
+            json.dumps({"step_index": 595, "type": "USER_INPUT", "source": "USER_EXPLICIT", "content": "RECENT_TURN_USER"})
+        )
+        lines.append(
+            json.dumps({"step_index": 596, "type": "PLANNER_RESPONSE", "content": "TAIL_MARKER_LAST_STEP"})
+        )
+        tr_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.assertGreater(tr_path.stat().st_size, 2 * hook.TRANSCRIPT_INITIAL_TAIL_BYTES)
+
+        steps = hook._load_transcript_steps({"transcriptPath": str(tr_path)}, core.load_session(cid))
+        self.assertIsInstance(steps, list)
+        self.assertGreater(len(steps), 0)
+        self.assertLess(len(steps), 597)
+        self.assertEqual(steps[-1]["content"], "TAIL_MARKER_LAST_STEP")
+
+        # Trailing step larger than initial 128KB window triggers reverse window expansion cleanly
+        big_tr_path = tr_dir / "transcript_big_tail.jsonl"
+        oversized_payload = "Y" * (hook.TRANSCRIPT_INITIAL_TAIL_BYTES + 32768)
+        big_tr_path.write_text(
+            json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "HEAD"}) + "\n"
+            + json.dumps({"step_index": 1, "type": "PLANNER_RESPONSE", "content": f"BIG_TAIL_END_MARKER_{oversized_payload}"}) + "\n",
+            encoding="utf-8",
+        )
+        big_steps = hook._load_transcript_steps({"transcriptPath": str(big_tr_path)}, core.load_session(cid))
+        self.assertEqual(len(big_steps), 2)
+        self.assertTrue(big_steps[-1]["content"].startswith("BIG_TAIL_END_MARKER_"))
+
+    def test_plan_mtime_fast_path_and_session_scan_cap(self) -> None:
+        """Settled plan stat skips SHA-256 re-hash, edits re-hash & mark stale, and list_all_sessions caps at MAX_SCANNED_SESSIONS."""
+        import os
+        from unittest import mock
+
+        cid = "conv-stat-fastpath"
+        plan_path = self.art_dir / "implementation_plan.md"
+        plan_path.write_text("# Plan v1\nInitial settled content.\n", encoding="utf-8")
+        old_ts = time.time() - 15.0
+        os.utime(plan_path, (old_ts, old_ts))
+
+        base_payload = self._base_payload(cid)
+        entry = core.build_plan_artifact_entry(
+            str(plan_path),
+            workspace_paths=base_payload.get("workspacePaths", []),
+            artifact_dir=str(self.art_dir),
+        )
+        self.assertIsNotNone(entry)
+        self.assertIn("mtimeNs", entry)
+        self.assertIn("sizeBytes", entry)
+        self.assertIn("inode", entry)
+        self.assertEqual(len(entry["sha256"]), 64)
+
+        st = core.load_session(cid)
+        st["planArtifact"] = entry
+        st["lifecycle"] = "WAITING_USER_DECISION"
+        st["sourceType"] = "APPROVAL_REQUIRED"
+        st["waitingOnUser"] = True
+        st["actor"] = "user"
+        st["nextAction"] = "Approve plan"
+        st["suggestedPrompt"] = "Proceed"
+
+        with mock.patch.object(core, "compute_file_sha256", wraps=core.compute_file_sha256) as spy_sha:
+            ev_unchanged = core.evaluate_staleness(st)
+            self.assertEqual(spy_sha.call_count, 0)
+            self.assertFalse(ev_unchanged["stale"])
+
+            # Mutate content -> size/mtime changes -> forces SHA-256 recompute & marks stale
+            plan_path.write_text("# Plan v2\nModified content that invalidates prompt.\n", encoding="utf-8")
+            ev_changed = core.evaluate_staleness(st)
+            self.assertGreaterEqual(spy_sha.call_count, 1)
+            self.assertTrue(ev_changed["stale"])
+            self.assertTrue(ev_changed["planArtifact"]["stale"])
+
+        # Populate 65 sessions with monotonic mtimes; verify MAX_SCANNED_SESSIONS=60 keeps newest 60 first
+        self.assertEqual(core.MAX_SCANNED_SESSIONS, 60)
+        core.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        base_ts = time.time() - 1000.0
+        for idx in range(65):
+            scid = f"conv-cap-{idx:03d}"
+            sdata = core.load_session(scid)
+            ts = base_ts + idx
+            sdata["updatedAt"] = ts
+            spath = core.session_path(scid)
+            spath.write_text(json.dumps(sdata), encoding="utf-8")
+            os.utime(spath, (ts, ts))
+
+        scanned = core.list_all_sessions()
+        self.assertEqual(len(scanned), 60)
+        scanned_ids = {item["conversationId"] for item in scanned}
+        self.assertEqual(scanned[0]["conversationId"], "conv-cap-064")
+        self.assertNotIn("conv-cap-000", scanned_ids)
+        self.assertNotIn("conv-cap-004", scanned_ids)
+
+    def test_astra_consensus_isolation_scan_workspace_and_untruncated_options(self) -> None:
+        """Cover all 7 Codex Astra consensus criteria: full prefix scan, summary/detail split, missing host ID, <=60 read budget, workspace path keys, and untruncated multi-question options."""
+        import os
+        from pathlib import Path as _Path
+        from unittest import mock
+
+        # 1 + 4. Populate 250 sessions to test prefix ambiguity across cap & <=60 JSON read budget
+        core.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        base_ts = time.time() - 5000.0
+        for idx in range(250):
+            if idx == 5:
+                cid = "abcd-old"
+            elif idx == 6:
+                cid = "uniq99-old"
+            elif idx == 7:
+                cid = "zcorrupt-valid"
+            elif 10 <= idx < 20:
+                cid = f"amany-{idx:02d}"
+            elif idx == 240:
+                cid = "abcd-new"
+            else:
+                cid = f"bulk-{idx:03d}"
+            sdata = core.load_session(cid)
+            ts = base_ts + idx
+            sdata["updatedAt"] = ts
+            sdata["workspacePaths"] = [f"/projects/bulk_{idx % 3}"]
+            spath = core.session_path(cid)
+            spath.write_text(json.dumps(sdata), encoding="utf-8")
+            os.utime(spath, (ts, ts))
+
+        corrupt_path = core.session_path("zcorrupt-bad")
+        corrupt_path.write_text("{corrupt json", encoding="utf-8")
+        os.utime(corrupt_path, (base_ts + 8, base_ts + 8))
+
+        orig_read_text = _Path.read_text
+
+        def _count_session_reads(spy_self: _Path, *args: object, **kwargs: object) -> str:
+            if spy_self.parent == core.SESSIONS_DIR and spy_self.suffix == ".json":
+                read_calls.append(spy_self.name)
+            return orig_read_text(spy_self, *args, **kwargs)
+
+        # Prefix colliding between outside-60 abcd-old and inside-60 abcd-new must stay unbound/ambiguous
+        res_ambig = core.build_side_panel_payload(bound_cid="abcd")
+        self.assertEqual(res_ambig["bindingMode"], "unbound")
+        self.assertTrue(res_ambig["ambiguousPrefix"])
+        self.assertIsNone(res_ambig["selectedSession"])
+
+        # Prefix matching 1 valid + 1 corrupt file must refuse to confirm unique
+        res_corrupt = core.build_side_panel_payload(bound_cid="zcorrupt")
+        self.assertEqual(res_corrupt["bindingMode"], "unbound")
+        self.assertTrue(res_corrupt["ambiguousPrefix"])
+        self.assertIsNone(res_corrupt["selectedSession"])
+
+        # Unique old session outside top-60 scan window still binds cleanly by prefix
+        res_uniq = core.build_side_panel_payload(bound_cid="uniq99")
+        self.assertEqual(res_uniq["bindingMode"], "explicit")
+        self.assertFalse(res_uniq["ambiguousPrefix"])
+        self.assertEqual(res_uniq["selectedSession"]["conversationId"], "uniq99-old")
+
+        # Hard <=60 JSON read budget even with zero-matching workspace filter and limit=500; prefix <=2 extra reads
+        read_calls: list[str] = []
+        with mock.patch.object(_Path, "read_text", autospec=True, side_effect=_count_session_reads):
+            list_zero = core.list_all_sessions(workspace_filter="/nonexistent/ws", max_sessions=500)
+            self.assertEqual(list_zero, [])
+            self.assertLessEqual(len(read_calls), 60)
+
+            read_calls.clear()
+            panel_zero = core.build_side_panel_payload(workspace_filter="/nonexistent/ws", limit=500)
+            self.assertEqual(panel_zero["sessions"], [])
+            self.assertLessEqual(len(read_calls), 60)
+
+            read_calls.clear()
+            panel_many = core.build_side_panel_payload(bound_cid="amany", workspace_filter="/nonexistent/ws", limit=500)
+            self.assertEqual(panel_many["bindingMode"], "unbound")
+            self.assertTrue(panel_many["ambiguousPrefix"])
+            self.assertLessEqual(len(read_calls), 62)
+
+        # 2. Summary vs Detail split: Session B secrets never leak into {} or Session A response
+        cid_a = "conv-secret-a"
+        cid_b = "conv-secret-b"
+        ws_proj_foo = "/tmp/ws_collision/projects/foo"
+        ws_work_foo = "/tmp/ws_collision/work/foo"
+        plan_b_secret = self.art_dir / "secret_b_plan.md"
+        plan_b_secret.write_text("# Secret B Plan\n", encoding="utf-8")
+
+        hook.handle_pre_invocation(self._base_payload(cid_a, workspacePaths=[ws_proj_foo], lastUserInput="task A"))
+        hook.handle_stop(self._base_payload(cid_a, workspacePaths=[ws_proj_foo], terminationReason="NO_TOOL_CALL", fullyIdle=True))
+
+        hook.handle_pre_invocation(self._base_payload(cid_b, workspacePaths=[ws_work_foo], lastUserInput="task B"))
+        pub_b_secret = {
+            "next_action": "执行 B 专属动作",
+            "detail": "UNIQUE_B_DETAIL_SECRET",
+            "suggested_prompt": "UNIQUE_B_PROMPT_SECRET",
+            "plan_path": str(plan_b_secret),
+            "actor": "user",
+            "waiting_on_user": True,
+        }
+        pre_bs = hook.handle_pre_tool_use(
+            self._base_payload(
+                cid_b,
+                workspacePaths=[ws_work_foo],
+                stepIdx=3,
+                toolCall={"id": "tc_bs", "name": "mcp_next-step_next_step_publish", "args": pub_b_secret},
+            )
+        )
+        mcp_server._handle_tool_call("next_step_publish", dict(pub_b_secret, **pre_bs["overwrite"]))
+        hook.handle_post_tool_use(
+            self._base_payload(
+                cid_b,
+                workspacePaths=[ws_work_foo],
+                stepIdx=3,
+                toolCall={"id": "tc_bs", "name": "mcp_next-step_next_step_publish", "args": pub_b_secret},
+            )
+        )
+        hook.handle_stop(self._base_payload(cid_b, workspacePaths=[ws_work_foo], terminationReason="NO_TOOL_CALL", fullyIdle=True))
+        # Also record a multi-question B variant with secret Q2 question & options
+        cid_b_q = "conv-secret-bq"
+        hook.handle_pre_invocation(self._base_payload(cid_b_q, workspacePaths=[], lastUserInput="task B Q"))
+        hook.handle_pre_tool_use(
+            self._base_payload(
+                cid_b_q,
+                workspacePaths=[],
+                stepIdx=4,
+                toolCall={
+                    "id": "tc_bq",
+                    "name": "ask_question",
+                    "args": {
+                        "questions": [
+                            {"question": "Confirm B mode?", "options": ["UNIQUE_B_OPT_SECRET"]},
+                            {"question": "UNIQUE_B_QUESTION_SECRET", "options": ["UNIQUE_B_OPT2_SECRET"]},
+                        ]
+                    },
+                },
+            )
+        )
+
+        unbound_dump = json.dumps(mcp_server._handle_tool_call("next_step_side_panel", {})["structuredContent"], ensure_ascii=False)
+        bound_a_dump = json.dumps(
+            mcp_server._handle_tool_call("next_step_side_panel", {"_sys_conversation_id": cid_a})["structuredContent"],
+            ensure_ascii=False,
+        )
+        for marker in (
+            "UNIQUE_B_PROMPT_SECRET",
+            "UNIQUE_B_DETAIL_SECRET",
+            "UNIQUE_B_OPT_SECRET",
+            "UNIQUE_B_OPT2_SECRET",
+            "UNIQUE_B_QUESTION_SECRET",
+            "secret_b_plan.md",
+        ):
+            self.assertNotIn(marker, unbound_dump)
+            self.assertNotIn(marker, bound_a_dump)
+
+        # 3. Missing host conversationId in PreToolUse/PostToolUse never creates default session or hook_bound
+        default_json = core.session_path("default")
+        self.assertFalse(default_json.exists())
+
+        pre_panel_empty = hook.handle_pre_tool_use({"toolCall": {"id": "tc_pe", "name": "mcp_next-step_next_step_side_panel", "args": {}}})
+        self.assertNotIn("_sys_conversation_id", pre_panel_empty.get("overwrite", {}))
+        hook.handle_post_tool_use({"toolCall": {"id": "tc_pe", "name": "mcp_next-step_next_step_side_panel", "args": {}}})
+        panel_empty_res = mcp_server._handle_tool_call("next_step_side_panel", pre_panel_empty.get("overwrite", {}))
+        self.assertEqual(panel_empty_res["structuredContent"]["bindingMode"], "unbound")
+        self.assertFalse(default_json.exists())
+
+        pre_panel_exp = hook.handle_pre_tool_use(
+            {"toolCall": {"id": "tc_px", "name": "mcp_next-step_next_step_side_panel", "args": {"conversation_id": cid_a}}}
+        )
+        self.assertNotIn("_sys_conversation_id", pre_panel_exp.get("overwrite", {}))
+        panel_exp_res = mcp_server._handle_tool_call(
+            "next_step_side_panel",
+            dict({"conversation_id": cid_a}, **pre_panel_exp.get("overwrite", {})),
+        )
+        self.assertEqual(panel_exp_res["structuredContent"]["bindingMode"], "explicit")
+        self.assertFalse(default_json.exists())
+
+        pub_unattr = {"next_action": "Unattributed publish", "actor": "user", "waiting_on_user": True}
+        pre_pub_no_id = hook.handle_pre_tool_use(
+            {"toolCall": {"id": "tc_pu", "name": "mcp_next-step_next_step_publish", "args": pub_unattr}}
+        )
+        self.assertNotIn("_sys_conversation_id", pre_pub_no_id.get("overwrite", {}))
+        hook.handle_post_tool_use({"toolCall": {"id": "tc_pu", "name": "mcp_next-step_next_step_publish", "args": pub_unattr}})
+        self.assertFalse(default_json.exists())
+        self.assertFalse(core.LATEST_PENDING_PATH.exists())
+
+        # 5. Workspace canonical keys, disambiguated colliding labels, & distinct __none__ key
+        ws_panel = core.build_side_panel_payload(limit=30)
+        opts_by_key = {o["key"]: o["label"] for o in ws_panel["workspaceOptions"]}
+        key_proj = core.normalize_workspace_path(ws_proj_foo)
+        key_work = core.normalize_workspace_path(ws_work_foo)
+        self.assertIn(key_proj, opts_by_key)
+        self.assertIn(key_work, opts_by_key)
+        self.assertIn("__none__", opts_by_key)
+        self.assertNotIn("", opts_by_key)
+        self.assertNotEqual(opts_by_key[key_proj], opts_by_key[key_work])
+        self.assertIn("projects/foo", opts_by_key[key_proj])
+        self.assertIn("work/foo", opts_by_key[key_work])
+
+        # 6. >8 questions, >12 options, and >300-char option with tail marker preserved verbatim in panel & Markdown
+        tail_marker = "OPT_TAIL_GUARD_99"
+        long_opt = ("Z" * 340) + tail_marker
+        many_questions = [
+            {"question": f"Q{i} prompt?", "options": [f"Q{i}-A", f"Q{i}-B"]}
+            for i in range(1, 10)
+        ]
+        many_questions.append(
+            {
+                "question": "Q10 final prompt?",
+                "options": [f"Choice-{j}" for j in range(1, 14)] + [long_opt],
+            }
+        )
+        cid_mq = "conv-many-q-unclipped"
+        hook.handle_pre_invocation(self._base_payload(cid_mq, workspacePaths=[ws_proj_foo], lastUserInput="many questions"))
+        hook.handle_pre_tool_use(
+            self._base_payload(
+                cid_mq,
+                workspacePaths=[ws_proj_foo],
+                stepIdx=12,
+                toolCall={"id": "tc_mq10", "name": "ask_question", "args": {"questions": many_questions}},
+            )
+        )
+        st_mq = core.load_session(cid_mq)
+        panel_mq = core.build_side_panel_payload(bound_cid=cid_mq, binding_mode="hook_bound")
+        sel_mq = panel_mq["selectedSession"]
+        self.assertEqual(len(sel_mq["questions"]), 10)
+        self.assertEqual(len(sel_mq["questions"][9]["options"]), 14)
+        self.assertEqual(sel_mq["questions"][9]["options"][13], long_opt)
+        self.assertTrue(sel_mq["questions"][9]["options"][13].endswith(tail_marker))
+        self.assertIn(f"[Q10] {long_opt}", sel_mq["options"])
+        md_mq = core.format_session_markdown(st_mq)
+        txt_mq = core.format_side_panel_text(panel_mq)
+        self.assertIn(tail_marker, md_mq)
+        self.assertIn(tail_marker, txt_mq)
+
+        # 7. Round 3 regressions: hook_bound exact-only, spoofed _sys_conversation_id strip, /work vs /work/foo exact workspace match, next_step_get prefix lookup, & unattributed next_step_publish error
+        hook.handle_pre_invocation(self._base_payload("team-fork", workspacePaths=["/tmp/ws_exact/work/foo"], lastUserInput="forked"))
+        hook.handle_stop(self._base_payload("team-fork", workspacePaths=["/tmp/ws_exact/work/foo"], terminationReason="NO_TOOL_CALL", fullyIdle=True))
+        res_hook_exact = core.build_side_panel_payload(bound_cid="team", binding_mode="hook_bound")
+        self.assertEqual(res_hook_exact["bindingMode"], "hook_bound")
+        self.assertEqual(res_hook_exact["boundConversationId"], "team")
+        self.assertTrue(res_hook_exact["sessionNotFound"])
+        self.assertIsNone(res_hook_exact["selectedSession"])
+        res_explicit_team = core.build_side_panel_payload(bound_cid="team", binding_mode="explicit")
+        self.assertEqual(res_explicit_team["bindingMode"], "explicit")
+        self.assertEqual(res_explicit_team["selectedSession"]["conversationId"], "team-fork")
+
+        # Missing host conversationId with spoofed _sys_conversation_id across direct & call_mcp_tool paths
+        spoof_panel_direct = hook.handle_pre_tool_use(
+            {"toolCall": {"id": "tc_spd", "name": "mcp_next-step_next_step_side_panel", "args": {"_sys_conversation_id": cid_a}}}
+        )
+        merged_spd = dict({"_sys_conversation_id": cid_a}, **spoof_panel_direct.get("overwrite", {}))
+        res_spd = mcp_server._handle_tool_call("next_step_side_panel", merged_spd)
+        self.assertEqual(res_spd["structuredContent"]["bindingMode"], "unbound")
+        self.assertIsNone(res_spd["structuredContent"]["selectedSession"])
+
+        spoof_panel_exp = hook.handle_pre_tool_use(
+            {"toolCall": {"id": "tc_spx", "name": "mcp_next-step_next_step_side_panel", "args": {"_sys_conversation_id": cid_b, "conversation_id": cid_a}}}
+        )
+        merged_spx = dict({"_sys_conversation_id": cid_b, "conversation_id": cid_a}, **spoof_panel_exp.get("overwrite", {}))
+        res_spx = mcp_server._handle_tool_call("next_step_side_panel", merged_spx)
+        self.assertEqual(res_spx["structuredContent"]["bindingMode"], "explicit")
+        self.assertEqual(res_spx["structuredContent"]["boundConversationId"], cid_a)
+
+        spoof_panel_wrap = hook.handle_pre_tool_use(
+            {"toolCall": {"id": "tc_spw", "name": "call_mcp_tool", "args": {"ServerName": "next-step_next_step", "ToolName": "next_step_side_panel", "Arguments": {"_sys_conversation_id": cid_a}}}}
+        )
+        self.assertNotIn("_sys_conversation_id", spoof_panel_wrap["overwrite"]["Arguments"])
+        res_spw = mcp_server._handle_tool_call("next_step_side_panel", spoof_panel_wrap["overwrite"]["Arguments"])
+        self.assertEqual(res_spw["structuredContent"]["bindingMode"], "unbound")
+
+        st_a_before = core.load_session(cid_a)
+        spoof_pub_direct = hook.handle_pre_tool_use(
+            {"toolCall": {"id": "tc_pubd", "name": "mcp_next-step_next_step_publish", "args": {"_sys_conversation_id": cid_a, "next_action": "spoofed!"}}}
+        )
+        self.assertEqual(spoof_pub_direct["overwrite"]["_sys_conversation_id"], "")
+        res_pubd = mcp_server._handle_tool_call("next_step_publish", dict({"_sys_conversation_id": cid_a, "next_action": "spoofed!"}, **spoof_pub_direct["overwrite"]))
+        self.assertTrue(res_pubd["isError"])
+        self.assertEqual(core.load_session(cid_a), st_a_before)
+
+        spoof_pub_wrap = hook.handle_pre_tool_use(
+            {"toolCall": {"id": "tc_pubw", "name": "call_mcp_tool", "args": {"ServerName": "next-step_next_step", "ToolName": "next_step_publish", "Arguments": {"_sys_conversation_id": cid_a, "next_action": "spoofed!"}}}}
+        )
+        self.assertNotIn("_sys_conversation_id", spoof_pub_wrap["overwrite"]["Arguments"])
+        self.assertEqual(core.load_session(cid_a), st_a_before)
+
+        # /work vs /work/foo exact workspace separation in list_all_sessions
+        hook.handle_pre_invocation(self._base_payload("ws-parent-only", workspacePaths=["/tmp/ws_exact/work"], lastUserInput="parent"))
+        hook.handle_stop(self._base_payload("ws-parent-only", workspacePaths=["/tmp/ws_exact/work"], terminationReason="NO_TOOL_CALL", fullyIdle=True))
+        child_only = core.list_all_sessions(workspace_filter="/tmp/ws_exact/work/foo")
+        self.assertEqual([s["conversationId"] for s in child_only], ["team-fork"])
+        parent_only = core.list_all_sessions(workspace_filter="/tmp/ws_exact/work")
+        self.assertEqual([s["conversationId"] for s in parent_only], ["ws-parent-only"])
+
+        # next_step_get uses full-dir prefix resolution & refuses ambiguous matches
+        get_old = mcp_server._handle_tool_call("next_step_get", {"conversation_id": "uniq99"})
+        self.assertFalse(get_old["isError"])
+        self.assertIn("uniq99-old", get_old["content"][0]["text"])
+        get_ambig = mcp_server._handle_tool_call("next_step_get", {"conversation_id": "abcd"})
+        self.assertIn("匹配多个会话", get_ambig["content"][0]["text"])
+
+        # Unattributed next_step_publish performs 0 writes & returns explicit isError=True
+        sessions_snapshot_before = sorted(p.name for p in core.SESSIONS_DIR.glob("*.json"))
+        orphan_pub = mcp_server._handle_tool_call("next_step_publish", {"next_action": "Should not publish"})
+        self.assertTrue(orphan_pub["isError"])
+        self.assertIn("缺少会话归属", orphan_pub["content"][0]["text"])
+        self.assertNotIn("pending-", orphan_pub["content"][0]["text"])
+        self.assertEqual(sessions_snapshot_before, sorted(p.name for p in core.SESSIONS_DIR.glob("*.json")))
+        self.assertFalse(core.LATEST_PENDING_PATH.exists())
+        self.assertFalse(default_json.exists())
+
+        # 8. Round 4 regressions: app-only next_step_panel_state exact-only lookup & dual-path primary workspace matching
+        state_team = mcp_server._handle_tool_call("next_step_panel_state", {"conversation_id": "team"})
+        sc_team = state_team["structuredContent"]
+        self.assertEqual(sc_team["boundConversationId"], "team")
+        self.assertTrue(sc_team["sessionNotFound"])
+        self.assertIsNone(sc_team["selectedSession"])
+
+        ws_pri = "/tmp/ws_multi/primary_a"
+        ws_sec = "/tmp/ws_multi/secondary_b"
+        hook.handle_pre_invocation(self._base_payload("ws-multi-ab", workspacePaths=[ws_pri, ws_sec], lastUserInput="multi ws"))
+        hook.handle_stop(self._base_payload("ws-multi-ab", workspacePaths=[ws_pri, ws_sec], terminationReason="NO_TOOL_CALL", fullyIdle=True))
+        pri_list = core.list_all_sessions(workspace_filter=ws_pri)
+        pri_panel = core.build_side_panel_payload(workspace_filter=ws_pri)
+        self.assertEqual([s["conversationId"] for s in pri_list], ["ws-multi-ab"])
+        self.assertEqual(len(pri_panel["sessions"]), 1)
+        self.assertEqual(pri_panel["totalSessions"], 1)
+        sec_list = core.list_all_sessions(workspace_filter=ws_sec)
+        sec_panel = core.build_side_panel_payload(workspace_filter=ws_sec)
+        self.assertEqual(sec_list, [])
+        self.assertEqual(sec_panel["sessions"], [])
+        self.assertEqual(sec_panel["totalSessions"], 0)
 
 
 if __name__ == "__main__":

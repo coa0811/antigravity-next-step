@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
-"""Core state machine, persistence, staleness detection, and HUD HTML rendering for next-step plugin."""
+"""Core state machine, persistence, staleness detection, and view-model builders for next-step plugin."""
 
 from __future__ import annotations
 
 import copy
 import datetime
 import hashlib
-import html
 import json
 import os
 import re
 import tempfile
 import time
 import traceback
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 MAX_HASH_FILE_BYTES = 2_000_000
 WATCHDOG_TIMEOUT_SEC = 120.0
 TOOL_APPROVAL_HINT_SEC = 8.0
+MAX_SCANNED_SESSIONS = 60
+PLAN_STAT_SETTLE_NS = 2_000_000_000
 
 MUTATING_FILE_TOOLS = {
     "write_file",
@@ -42,23 +44,16 @@ DATA_DIR = Path(
 SESSIONS_DIR = DATA_DIR / "sessions"
 PENDING_DIR = DATA_DIR / "pending"
 LATEST_PENDING_PATH = PENDING_DIR / "latest.json"
-LATEST_MD_PATH = DATA_DIR / "latest_next_step.md"
-SNAPSHOT_HTML_PATH = DATA_DIR / "hud_snapshot.html"
-HUD_SERVER_JSON_PATH = DATA_DIR / "hud_server.json"
 ERROR_LOG_PATH = DATA_DIR / "error.log"
 
 
 def set_data_dir(new_dir: Path) -> None:
     """Redirect plugin data directory (used by tests and custom environments)."""
-    global DATA_DIR, SESSIONS_DIR, PENDING_DIR, LATEST_PENDING_PATH
-    global LATEST_MD_PATH, SNAPSHOT_HTML_PATH, HUD_SERVER_JSON_PATH, ERROR_LOG_PATH
+    global DATA_DIR, SESSIONS_DIR, PENDING_DIR, LATEST_PENDING_PATH, ERROR_LOG_PATH
     DATA_DIR = Path(new_dir).resolve()
     SESSIONS_DIR = DATA_DIR / "sessions"
     PENDING_DIR = DATA_DIR / "pending"
     LATEST_PENDING_PATH = PENDING_DIR / "latest.json"
-    LATEST_MD_PATH = DATA_DIR / "latest_next_step.md"
-    SNAPSHOT_HTML_PATH = DATA_DIR / "hud_snapshot.html"
-    HUD_SERVER_JSON_PATH = DATA_DIR / "hud_server.json"
     ERROR_LOG_PATH = DATA_DIR / "error.log"
 
 
@@ -135,7 +130,6 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
         with os.fdopen(fd, "wb") as fh:
             fh.write(encoded)
             fh.flush()
-            os.fsync(fh.fileno())
         os.replace(tmp_name, path)
     except Exception:
         try:
@@ -143,6 +137,16 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
         except OSError:
             pass
         raise
+
+
+def _stat_plan_fast(path: Path) -> os.stat_result | None:
+    """Return stat metadata for an existing regular file, or None."""
+    try:
+        if not path.is_file():
+            return None
+        return path.stat()
+    except OSError:
+        return None
 
 
 def compute_file_sha256(path: Path) -> tuple[str | None, int | None]:
@@ -218,11 +222,14 @@ def build_plan_artifact_entry(
     if resolved is None:
         return None
     sha256, mtime_ns = compute_file_sha256(resolved)
+    st = _stat_plan_fast(resolved)
     return {
         "path": str(resolved),
         "name": resolved.name,
         "sha256": sha256,
         "mtimeNs": mtime_ns,
+        "sizeBytes": st.st_size if st is not None else None,
+        "inode": st.st_ino if st is not None else None,
         "summary": (str(summary).strip() or None) if summary else None,
         "requestFeedback": bool(request_feedback),
         "stale": False,
@@ -257,6 +264,7 @@ def default_session_state(cid: str = "default") -> dict[str, Any]:
         "detail": None,
         "suggestedPrompt": None,
         "options": [],
+        "questions": [],
         "activeTool": None,
         "planArtifact": None,
         "pendingPlanReview": None,
@@ -326,7 +334,19 @@ def evaluate_staleness(state: dict[str, Any], now: float | None = None) -> dict[
 
     plan = out.get("planArtifact")
     if isinstance(plan, dict) and plan.get("path") and plan.get("sha256"):
-        disk_sha, disk_mtime = compute_file_sha256(Path(str(plan["path"])))
+        plan_file = Path(str(plan["path"]))
+        st = _stat_plan_fast(plan_file)
+        if st is None:
+            disk_sha, disk_mtime = None, None
+        elif (
+            plan.get("mtimeNs") == st.st_mtime_ns
+            and plan.get("sizeBytes") == st.st_size
+            and plan.get("inode") == st.st_ino
+            and (time.time_ns() - st.st_mtime_ns) > PLAN_STAT_SETTLE_NS
+        ):
+            disk_sha, disk_mtime = plan.get("sha256"), st.st_mtime_ns
+        else:
+            disk_sha, disk_mtime = compute_file_sha256(plan_file)
         if disk_sha != plan.get("sha256"):
             plan["stale"] = True
             plan["staleReason"] = "关联计划文件已改写或移除"
@@ -372,10 +392,6 @@ def save_session(cid: str, state: dict[str, Any], now: float | None = None) -> d
     state["updatedAt"] = cur_now
     state["updatedAtIso"] = iso_now(cur_now)
     atomic_write_json(session_path(clean_cid), state)
-    try:
-        write_snapshots(state, now=cur_now)
-    except Exception as exc:
-        append_error_log("write_snapshots", exc)
     return state
 
 
@@ -503,6 +519,7 @@ def stage_declaration(
         state["detail"] = decl.get("detail")
         state["suggestedPrompt"] = decl.get("suggested_prompt")
         state["options"] = []
+        state["questions"] = []
         state["planArtifact"] = decl.get("planArtifact")
         state["stale"] = False
         state["staleReason"] = None
@@ -571,6 +588,7 @@ def promote_plan_review_to_active(state: dict[str, Any], plan_review: dict[str, 
     state["nextAction"] = str(plan_review.get("nextAction") or "审阅计划工件并点击 Proceed 或提交评论")
     state["detail"] = plan_review.get("detail")
     state["options"] = []
+    state["questions"] = []
     state["suggestedPrompt"] = None
     if isinstance(plan_review.get("planArtifact"), dict):
         state["planArtifact"] = plan_review["planArtifact"]
@@ -596,6 +614,7 @@ def promote_declaration_to_active(state: dict[str, Any], decl: dict[str, Any], f
     state["detail"] = decl.get("detail")
     state["suggestedPrompt"] = decl.get("suggested_prompt")
     state["options"] = []
+    state["questions"] = []
     state["planArtifact"] = (
         copy.deepcopy(decl.get("planArtifact"))
         if isinstance(decl.get("planArtifact"), dict)
@@ -611,46 +630,74 @@ def promote_declaration_to_active(state: dict[str, Any], decl: dict[str, Any], f
         state["planArtifact"] = evaluated["planArtifact"]
 
 
+def normalize_workspace_path(raw: str | None) -> str:
+    """Return a canonical workspace key string or empty string if blank."""
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    try:
+        return str(Path(s).expanduser().resolve())
+    except OSError:
+        return s.rstrip("/") or s
+
+
+def _normalize_workspace_filter(raw: str | None) -> str | None:
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    if s == "__none__":
+        return "__none__"
+    return normalize_workspace_path(s) or None
+
+
+def _session_matches_workspace(raw: dict[str, Any], norm_ws: str | None) -> bool:
+    if not norm_ws:
+        return True
+    ws_list = [str(x) for x in (raw.get("workspacePaths") or []) if x]
+    if norm_ws == "__none__":
+        return len(ws_list) == 0
+    primary_ws = normalize_workspace_path(ws_list[0]) if ws_list else ""
+    return bool(primary_ws) and primary_ws == norm_ws
+
+
 def list_all_sessions(
     workspace_filter: str | None = None,
     now: float | None = None,
+    max_sessions: int = MAX_SCANNED_SESSIONS,
 ) -> list[dict[str, Any]]:
-    """Load, evaluate staleness, filter, and sort all recorded sessions."""
+    """Load, evaluate staleness, filter, and sort recent recorded sessions (capped at MAX_SCANNED_SESSIONS reads)."""
     ensure_data_dirs()
     cur_now = time.time() if now is None else now
-    norm_ws: str | None = None
-    if workspace_filter:
-        try:
-            norm_ws = str(Path(workspace_filter).expanduser().resolve())
-        except OSError:
-            norm_ws = str(workspace_filter).strip()
+    norm_ws = _normalize_workspace_filter(workspace_filter)
+
+    candidates: list[tuple[int, str]] = []
+    if SESSIONS_DIR.is_dir():
+        with os.scandir(SESSIONS_DIR) as it:
+            for entry in it:
+                if not entry.name.endswith(".json") or entry.name.startswith("."):
+                    continue
+                try:
+                    st = entry.stat()
+                    candidates.append((st.st_mtime_ns, entry.path))
+                except OSError:
+                    continue
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    cap = min(MAX_SCANNED_SESSIONS, max(1, int(max_sessions)))
 
     results: list[dict[str, Any]] = []
-    for p in SESSIONS_DIR.glob("*.json"):
-        if p.name.startswith("."):
-            continue
+    for _, path_str in candidates[:cap]:
         try:
-            raw = json.loads(p.read_text(encoding="utf-8"))
+            raw = json.loads(Path(path_str).read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 continue
         except Exception:
             continue
 
-        evaluated = evaluate_staleness(raw, now=cur_now)
-        if norm_ws:
-            ws_list = [str(x) for x in (evaluated.get("workspacePaths") or []) if x]
-            matched = False
-            for w in ws_list:
-                try:
-                    rw = str(Path(w).expanduser().resolve())
-                except OSError:
-                    rw = w
-                if rw == norm_ws or rw.startswith(norm_ws + "/") or norm_ws.startswith(rw + "/"):
-                    matched = True
-                    break
-            if not matched:
-                continue
-        results.append(evaluated)
+        if not _session_matches_workspace(raw, norm_ws):
+            continue
+
+        results.append(evaluate_staleness(raw, now=cur_now))
 
     results.sort(
         key=lambda s: (
@@ -708,6 +755,92 @@ def format_status_badge(state: dict[str, Any]) -> str:
     return "⚪ 会话空闲（无挂起待办）"
 
 
+def _normalize_questions(raw_questions: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_questions, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw_questions:
+        if not isinstance(item, dict):
+            continue
+        q_title = str(item.get("question") or "").strip()
+        if not q_title:
+            continue
+        raw_opts = item.get("options") or []
+        opts = [
+            str(opt).strip()
+            for opt in raw_opts
+            if opt is not None and str(opt).strip()
+        ]
+        out.append(
+            {
+                "question": q_title,
+                "options": opts,
+                "multiSelect": bool(item.get("multiSelect", False)),
+            }
+        )
+    return out
+
+
+def _render_session_markdown_block(
+    *,
+    cid: str,
+    short_id: str,
+    ws_name: str,
+    last_input: str | None,
+    badge: str,
+    actor_label: str,
+    next_action: str,
+    source_label: str,
+    updated_at_iso: str,
+    detail: str | None = None,
+    stale: bool = False,
+    stale_reason: str | None = None,
+    approval_hint: str | None = None,
+    questions: list[dict[str, Any]] | None = None,
+    options: list[str] | None = None,
+    plan: dict[str, Any] | None = None,
+    suggested_prompt: str | None = None,
+    copy_blocked: bool = False,
+) -> str:
+    lines = [
+        f"### 会话 `#{short_id}` · `{ws_name}`",
+        f"- **完整会话 ID**：`{cid}`",
+        f"- **最近用户输入**：{last_input or '（尚无用户输入记录）'}",
+        f"- **是否在等我**：`{badge}`",
+        f"- **由谁做**：`{actor_label}`",
+        f"- **接下来要做什么**：**{next_action}**",
+        f"- **来源与可信度**：`{source_label}`",
+        f"- **最后更新时间**：`{updated_at_iso}`",
+    ]
+    if detail:
+        lines.append(f"- **补充说明**：{detail}")
+    if stale and stale_reason:
+        lines.append(f"- **过期提示**：`🟡 {stale_reason}`")
+    if approval_hint:
+        lines.append(f"- **权限弹窗提示**：`🟡 {approval_hint}`")
+    q_list = questions or []
+    if len(q_list) > 1:
+        lines.append("- **待选条目（多问题）**：")
+        for q_idx, q_item in enumerate(q_list, 1):
+            lines.append(f"  {q_idx}. **{q_item['question']}**")
+            for opt in q_item.get("options") or []:
+                lines.append(f"     - `{opt}`")
+    elif options:
+        lines.append("- **待选条目**：")
+        for idx, opt in enumerate(options, 1):
+            lines.append(f"  {idx}. `{opt}`")
+    if isinstance(plan, dict) and plan.get("path"):
+        plan_status = "🟡 已过期（文件已改写）" if plan.get("stale") else "未过期"
+        lines.append(f"- **关联计划工件**：`{plan.get('name') or plan['path']}`（{plan_status}）")
+    if suggested_prompt and not copy_blocked:
+        lines.append(
+            f"- **建议下一条指令（只读复制，由你决定是否提交）**：\n  ```text\n  {suggested_prompt}\n  ```"
+        )
+    elif suggested_prompt and copy_blocked:
+        lines.append("- **建议下一条指令**：`🟡 已过期，已阻止直接复制`")
+    return "\n".join(lines)
+
+
 def format_session_markdown(state: dict[str, Any]) -> str:
     """Format a single evaluated session state into concise Markdown."""
     ev = evaluate_staleness(state)
@@ -715,10 +848,6 @@ def format_session_markdown(state: dict[str, Any]) -> str:
     short_id = str(ev.get("shortId") or cid[:8])
     ws_list = ev.get("workspacePaths") or []
     ws_name = Path(ws_list[0]).name if ws_list else "default-workspace"
-    last_input = ev.get("lastUserInput") or "（尚无用户输入记录）"
-    badge = format_status_badge(ev)
-    actor_label = format_actor_label(ev.get("actor"), bool(ev.get("waitingOnUser")))
-    source_label = format_source_label(ev.get("sourceType"), ev.get("confidence"))
 
     next_action = ev.get("nextAction")
     if not next_action:
@@ -727,38 +856,30 @@ def format_session_markdown(state: dict[str, Any]) -> str:
         else:
             next_action = "当前无已声明的下一步（上一轮已正常结束，等待你输入新指令）"
 
-    lines = [
-        f"### 会话 `#{short_id}` · `{ws_name}`",
-        f"- **完整会话 ID**：`{cid}`",
-        f"- **最近用户输入**：{last_input}",
-        f"- **是否在等我**：`{badge}`",
-        f"- **由谁做**：`{actor_label}`",
-        f"- **接下来要做什么**：**{next_action}**",
-        f"- **来源与可信度**：`{source_label}`",
-        f"- **最后更新时间**：`{ev.get('updatedAtIso') or ''}`",
-    ]
-    if ev.get("detail"):
-        lines.append(f"- **补充说明**：{ev['detail']}")
-    if ev.get("stale") and ev.get("staleReason"):
-        lines.append(f"- **过期提示**：`🟡 {ev['staleReason']}`")
-    active_tool = ev.get("activeTool")
-    if isinstance(active_tool, dict) and active_tool.get("approvalHint"):
-        lines.append(f"- **权限弹窗提示**：`🟡 {active_tool['approvalHint']}`")
-    options = ev.get("options") or []
-    if options:
-        lines.append("- **待选条目**：")
-        for idx, opt in enumerate(options, 1):
-            lines.append(f"  {idx}. `{opt}`")
-    plan = ev.get("planArtifact")
-    if isinstance(plan, dict) and plan.get("path"):
-        plan_status = "🟡 已过期（文件已改写）" if plan.get("stale") else "未过期"
-        lines.append(f"- **关联计划工件**：`{plan.get('name') or plan['path']}`（{plan_status}）")
+    plan = ev.get("planArtifact") if isinstance(ev.get("planArtifact"), dict) else None
+    active_tool = ev.get("activeTool") if isinstance(ev.get("activeTool"), dict) else None
     copy_blocked = bool(ev.get("stale") or (isinstance(plan, dict) and plan.get("stale")))
-    if ev.get("suggestedPrompt") and not copy_blocked:
-        lines.append(f"- **建议下一条指令（只读复制，由你决定是否提交）**：\n  ```text\n  {ev['suggestedPrompt']}\n  ```")
-    elif ev.get("suggestedPrompt") and copy_blocked:
-        lines.append("- **建议下一条指令**：`🟡 已过期，已阻止直接复制`")
-    return "\n".join(lines)
+
+    return _render_session_markdown_block(
+        cid=cid,
+        short_id=short_id,
+        ws_name=ws_name,
+        last_input=ev.get("lastUserInput"),
+        badge=format_status_badge(ev),
+        actor_label=format_actor_label(ev.get("actor"), bool(ev.get("waitingOnUser"))),
+        next_action=next_action,
+        source_label=format_source_label(ev.get("sourceType"), ev.get("confidence")),
+        updated_at_iso=str(ev.get("updatedAtIso") or ""),
+        detail=ev.get("detail"),
+        stale=bool(ev.get("stale")),
+        stale_reason=ev.get("staleReason"),
+        approval_hint=active_tool.get("approvalHint") if active_tool else None,
+        questions=ev.get("questions") or [],
+        options=ev.get("options") or [],
+        plan=plan,
+        suggested_prompt=ev.get("suggestedPrompt"),
+        copy_blocked=copy_blocked,
+    )
 
 
 def _clip_str(val: Any, max_len: int) -> str | None:
@@ -772,13 +893,57 @@ def _clip_str(val: Any, max_len: int) -> str | None:
     return s[: max(0, max_len - 1)] + "…"
 
 
-def build_session_panel_item(state: dict[str, Any], now: float | None = None) -> dict[str, Any]:
-    """Build a bounded, strictly read-only structured view model for one session."""
+def _build_session_common(state: dict[str, Any], now: float | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Evaluate staleness once and assemble non-sensitive overview fields for summary/detail builders."""
     ev = evaluate_staleness(state, now=now)
     cid = str(ev.get("conversationId") or "default")
     short_id = str(ev.get("shortId") or cid[:8])
     ws_list = [str(w) for w in (ev.get("workspacePaths") or []) if w]
-    ws_name = Path(ws_list[0]).name if ws_list else "default-workspace"
+    ws_key = normalize_workspace_path(ws_list[0]) if ws_list else "__none__"
+    if ws_list:
+        ws_name = Path(ws_key).name or ws_key
+    else:
+        ws_name = "未关联工作区"
+
+    plan = ev.get("planArtifact")
+    is_stale = bool(ev.get("stale", False))
+    copy_blocked = bool(is_stale or (isinstance(plan, dict) and plan.get("stale")))
+    waiting_on_user = bool(ev.get("waitingOnUser", False))
+    actor = str(ev.get("actor") or "none")
+
+    summary = {
+        "conversationId": cid,
+        "shortId": short_id,
+        "workspaceName": ws_name,
+        "workspaceKey": ws_key,
+        "workspacePaths": ws_list[:4],
+        "lastUserInput": _clip_str(ev.get("lastUserInput"), 240),
+        "lifecycle": str(ev.get("lifecycle") or "IDLE"),
+        "sourceType": str(ev.get("sourceType") or "NONE"),
+        "confidence": str(ev.get("confidence") or "DETERMINISTIC"),
+        "waitingOnUser": waiting_on_user,
+        "actor": actor,
+        "actorLabel": format_actor_label(actor, waiting_on_user),
+        "statusBadge": format_status_badge(ev),
+        "sourceLabel": format_source_label(ev.get("sourceType"), ev.get("confidence")),
+        "nextAction": _clip_str(ev.get("nextAction"), 500),
+        "copyBlocked": copy_blocked,
+        "stale": is_stale,
+        "updatedAt": ev.get("updatedAt"),
+        "updatedAtIso": ev.get("updatedAtIso") or "",
+    }
+    return ev, summary
+
+
+def build_session_summary_item(state: dict[str, Any], now: float | None = None) -> dict[str, Any]:
+    """Build overview-only session item for list/filter rendering without leaking another session's prompts or options."""
+    _, summary = _build_session_common(state, now=now)
+    return summary
+
+
+def build_session_panel_item(state: dict[str, Any], now: float | None = None) -> dict[str, Any]:
+    """Build a strictly read-only detailed view model for the bound session."""
+    ev, base = _build_session_common(state, now=now)
 
     plan = ev.get("planArtifact")
     plan_item: dict[str, Any] | None = None
@@ -801,67 +966,143 @@ def build_session_panel_item(state: dict[str, Any], now: float | None = None) ->
             "elapsedSec": active_tool.get("elapsedSec"),
         }
 
-    is_stale = bool(ev.get("stale", False))
-    copy_blocked = bool(is_stale or (isinstance(plan_item, dict) and plan_item.get("stale")))
     raw_opts = ev.get("options") or []
     options = [
-        clipped
-        for clipped in (_clip_str(opt, 300) for opt in raw_opts[:12])
-        if clipped
+        str(opt).strip()
+        for opt in raw_opts
+        if opt is not None and str(opt).strip()
     ]
+    questions = _normalize_questions(ev.get("questions"))
 
-    waiting_on_user = bool(ev.get("waitingOnUser", False))
-    actor = str(ev.get("actor") or "none")
     raw_prompt = ev.get("suggestedPrompt")
     suggested_prompt = (
         str(raw_prompt).strip() or None
         if raw_prompt is not None
         else None
     )
-    return {
-        "conversationId": cid,
-        "shortId": short_id,
-        "workspaceName": ws_name,
-        "workspacePaths": ws_list[:4],
-        "modelName": _clip_str(ev.get("modelName"), 120),
-        "lastUserInput": _clip_str(ev.get("lastUserInput"), 240),
-        "lifecycle": str(ev.get("lifecycle") or "IDLE"),
-        "sourceType": str(ev.get("sourceType") or "NONE"),
-        "confidence": str(ev.get("confidence") or "DETERMINISTIC"),
-        "waitingOnUser": waiting_on_user,
-        "actor": actor,
-        "actorLabel": format_actor_label(actor, waiting_on_user),
-        "statusBadge": format_status_badge(ev),
-        "sourceLabel": format_source_label(ev.get("sourceType"), ev.get("confidence")),
-        "nextAction": _clip_str(ev.get("nextAction"), 500),
-        "detail": _clip_str(ev.get("detail"), 1500),
-        "options": options,
-        "suggestedPrompt": suggested_prompt,
-        "copyBlocked": copy_blocked,
-        "stale": is_stale,
-        "staleReason": _clip_str(ev.get("staleReason"), 240),
-        "planArtifact": plan_item,
-        "activeTool": tool_item,
-        "updatedAt": ev.get("updatedAt"),
-        "updatedAtIso": ev.get("updatedAtIso") or "",
-    }
+    base.update(
+        {
+            "modelName": _clip_str(ev.get("modelName"), 120),
+            "detail": _clip_str(ev.get("detail"), 1500),
+            "options": options,
+            "questions": questions,
+            "suggestedPrompt": suggested_prompt,
+            "staleReason": _clip_str(ev.get("staleReason"), 240),
+            "planArtifact": plan_item,
+            "activeTool": tool_item,
+        }
+    )
+    return base
+
+
+def resolve_target_session(
+    clean_cid: str,
+    *,
+    allow_prefix: bool = True,
+    workspace_filter: str | None = None,
+) -> tuple[dict[str, Any] | None, bool, bool]:
+    """Resolve exact session ID or (when allow_prefix=True) unique filename-scanned prefix. Returns (raw_state, ambiguous, not_found)."""
+    norm_ws = _normalize_workspace_filter(workspace_filter)
+    sp = session_path(clean_cid)
+    if sp.is_file():
+        try:
+            raw = json.loads(sp.read_text(encoding="utf-8"))
+        except Exception:
+            raw = None
+        if isinstance(raw, dict) and str(raw.get("conversationId") or "").strip() == clean_cid:
+            if _session_matches_workspace(raw, norm_ws):
+                return raw, False, False
+            return None, False, True
+
+    if not allow_prefix:
+        return None, False, True
+
+    safe_prefix = re.sub(r"[^A-Za-z0-9_.-]", "_", clean_cid)
+    matched_paths: list[Path] = []
+    if SESSIONS_DIR.is_dir():
+        with os.scandir(SESSIONS_DIR) as it:
+            for entry in it:
+                if not entry.name.endswith(".json") or entry.name.startswith("."):
+                    continue
+                if entry.name[:-5].startswith(safe_prefix):
+                    matched_paths.append(Path(entry.path))
+
+    if not matched_paths:
+        return None, False, True
+
+    confirmed: list[dict[str, Any]] = []
+    unverified = False
+    reads = 0
+    for mp in matched_paths:
+        if reads >= 2:
+            unverified = True
+            break
+        reads += 1
+        try:
+            raw = json.loads(mp.read_text(encoding="utf-8"))
+        except Exception:
+            unverified = True
+            continue
+        if not isinstance(raw, dict):
+            unverified = True
+            continue
+        if str(raw.get("conversationId") or "").startswith(clean_cid) and _session_matches_workspace(raw, norm_ws):
+            confirmed.append(raw)
+            if len(confirmed) > 1:
+                break
+
+    if len(confirmed) > 1 or unverified:
+        return None, True, False
+    if len(confirmed) == 1:
+        return confirmed[0], False, False
+    return None, False, True
+
+
+def _build_workspace_options(
+    session_items: list[dict[str, Any]],
+    active_filter: str | None = None,
+) -> list[dict[str, str]]:
+    """Build canonical path-keyed workspace filter options with basename disambiguation."""
+    key_to_name: dict[str, str] = {}
+    for item in session_items:
+        wk = str(item.get("workspaceKey") or "__none__")
+        if wk not in key_to_name:
+            key_to_name[wk] = str(item.get("workspaceName") or ("未关联工作区" if wk == "__none__" else Path(wk).name or wk))
+
+    if active_filter and active_filter not in key_to_name:
+        key_to_name[active_filter] = "未关联工作区" if active_filter == "__none__" else (Path(active_filter).name or active_filter)
+
+    real_keys = [k for k in key_to_name if k != "__none__"]
+    name_counts = Counter(key_to_name[k] for k in real_keys)
+
+    options: list[dict[str, str]] = []
+    for wk in sorted(real_keys, key=lambda k: (key_to_name[k].lower(), k)):
+        base_name = key_to_name[wk]
+        label = f"{base_name} ({wk})" if name_counts[base_name] > 1 else base_name
+        options.append({"key": wk, "label": label})
+
+    if "__none__" in key_to_name:
+        options.append({"key": "__none__", "label": "未关联工作区"})
+    return options
 
 
 def build_side_panel_payload(
     bound_cid: str | None = None,
     binding_mode: str = "unbound",
     workspace_filter: str | None = None,
-    limit: int = 20,
+    limit: int = 30,
     now: float | None = None,
+    allow_prefix: bool | None = None,
 ) -> dict[str, Any]:
     """Build strictly read-only, session-isolated payload for the MCP Apps Side Panel."""
     cur_now = time.time() if now is None else now
     clean_cid = str(bound_cid or "").strip() or None
-    all_sessions = list_all_sessions(workspace_filter=workspace_filter, now=cur_now)
-    all_global = (
-        list_all_sessions(workspace_filter=None, now=cur_now)
-        if workspace_filter and clean_cid
-        else all_sessions
+    norm_ws = _normalize_workspace_filter(workspace_filter)
+    eff_limit = min(MAX_SCANNED_SESSIONS, max(1, int(limit)))
+    all_sessions = list_all_sessions(
+        workspace_filter=norm_ws,
+        now=cur_now,
+        max_sessions=MAX_SCANNED_SESSIONS,
     )
 
     eff_mode = "unbound"
@@ -871,31 +1112,25 @@ def build_side_panel_payload(
     ambiguous = False
 
     if clean_cid:
-        sp = session_path(clean_cid)
-        if sp.is_file():
-            raw_state = load_session(clean_cid)
-            selected_item = build_session_panel_item(raw_state, now=cur_now)
+        eff_allow_prefix = (binding_mode != "hook_bound") if allow_prefix is None else bool(allow_prefix)
+        raw_match, ambiguous, not_found = resolve_target_session(
+            clean_cid,
+            allow_prefix=eff_allow_prefix,
+        )
+        if raw_match is not None:
+            selected_item = build_session_panel_item(raw_match, now=cur_now)
             resolved_cid = selected_item["conversationId"]
             eff_mode = binding_mode if binding_mode in ("hook_bound", "explicit") else "explicit"
+        elif ambiguous:
+            eff_mode = "unbound"
         else:
-            matches = [
-                s for s in all_global if str(s.get("conversationId") or "").startswith(clean_cid)
-            ]
-            if len(matches) == 1:
-                selected_item = build_session_panel_item(matches[0], now=cur_now)
-                resolved_cid = selected_item["conversationId"]
-                eff_mode = binding_mode if binding_mode in ("hook_bound", "explicit") else "explicit"
-            elif len(matches) > 1:
-                ambiguous = True
-                eff_mode = "unbound"
-            else:
-                not_found = True
-                resolved_cid = clean_cid
-                eff_mode = binding_mode if binding_mode in ("hook_bound", "explicit") else "explicit"
+            resolved_cid = clean_cid
+            eff_mode = binding_mode if binding_mode in ("hook_bound", "explicit") else "explicit"
 
-    session_items = [build_session_panel_item(s, now=cur_now) for s in all_sessions[: max(1, limit)]]
+    session_items = [build_session_summary_item(s, now=cur_now) for s in all_sessions[:eff_limit]]
+    workspace_options = _build_workspace_options(session_items, active_filter=norm_ws)
     return {
-        "version": "0.3.0",
+        "version": "0.4.0",
         "generatedAtIso": iso_now(cur_now),
         "bindingMode": eff_mode,
         "boundConversationId": resolved_cid,
@@ -903,13 +1138,16 @@ def build_side_panel_payload(
         "ambiguousPrefix": ambiguous,
         "selectedSession": selected_item,
         "sessions": session_items,
+        "workspaceFilter": norm_ws,
+        "workspaceOptions": workspace_options,
+        "workspaces": [opt["label"] for opt in workspace_options],
         "totalSessions": len(all_sessions),
         "waitingCount": sum(1 for s in all_sessions if s.get("waitingOnUser")),
     }
 
 
 def format_side_panel_text(payload: dict[str, Any]) -> str:
-    """Format concise plain-text Markdown fallback for non-UI MCP clients."""
+    """Format concise plain-text Markdown fallback for non-UI MCP clients without re-reading disk."""
     mode = payload.get("bindingMode")
     cid = payload.get("boundConversationId")
     sessions = payload.get("sessions") or []
@@ -938,603 +1176,27 @@ def format_side_panel_text(payload: dict[str, Any]) -> str:
 
     sel = payload.get("selectedSession")
     if isinstance(sel, dict):
-        # Reuse format_session_markdown directly if the session file exists on disk
-        if cid and session_path(str(cid)).is_file():
-            return format_session_markdown(load_session(str(cid)))
-        next_act = sel.get("nextAction") or "当前无已声明的下一步"
-        lines = [
-            f"### 会话 `#{sel['shortId']}` · `{sel['workspaceName']}`",
-            f"- **完整会话 ID**：`{sel['conversationId']}`",
-            f"- **是否在等我**：`{sel['statusBadge']}`",
-            f"- **由谁做**：`{sel['actorLabel']}`",
-            f"- **接下来要做什么**：**{next_act}**",
-            f"- **来源与可信度**：`{sel['sourceLabel']}`",
-        ]
-        if sel.get("stale") and sel.get("staleReason"):
-            lines.append(f"- **过期提示**：`🟡 {sel['staleReason']}`")
-        if sel.get("suggestedPrompt") and not sel.get("copyBlocked"):
-            lines.append(f"- **建议下一条指令（只读复制）**：`{sel['suggestedPrompt']}`")
-        elif sel.get("suggestedPrompt") and sel.get("copyBlocked"):
-            lines.append("- **建议下一条指令**：`🟡 已过期，已阻止直接复制`")
-        return "\n".join(lines)
+        active_tool = sel.get("activeTool") if isinstance(sel.get("activeTool"), dict) else None
+        plan = sel.get("planArtifact") if isinstance(sel.get("planArtifact"), dict) else None
+        return _render_session_markdown_block(
+            cid=str(sel.get("conversationId") or cid or "default"),
+            short_id=str(sel.get("shortId") or str(cid or "default")[:8]),
+            ws_name=str(sel.get("workspaceName") or "default-workspace"),
+            last_input=sel.get("lastUserInput"),
+            badge=str(sel.get("statusBadge") or ""),
+            actor_label=str(sel.get("actorLabel") or "—"),
+            next_action=str(sel.get("nextAction") or "当前无已声明的下一步（上一轮已正常结束，等待你输入新指令）"),
+            source_label=str(sel.get("sourceLabel") or ""),
+            updated_at_iso=str(sel.get("updatedAtIso") or ""),
+            detail=sel.get("detail"),
+            stale=bool(sel.get("stale")),
+            stale_reason=sel.get("staleReason"),
+            approval_hint=active_tool.get("approvalHint") if active_tool else None,
+            questions=sel.get("questions") or [],
+            options=sel.get("options") or [],
+            plan=plan,
+            suggested_prompt=sel.get("suggestedPrompt"),
+            copy_blocked=bool(sel.get("copyBlocked")),
+        )
 
     return "当前暂无已记录的会话状态。"
-
-
-def write_snapshots(latest_state: dict[str, Any] | None = None, now: float | None = None) -> None:
-    """Write latest_next_step.md and static hud_snapshot.html to DATA_DIR."""
-    ensure_data_dirs()
-    sessions = list_all_sessions(now=now)
-    if latest_state is not None and not sessions:
-        sessions = [evaluate_staleness(latest_state, now=now)]
-
-    md_parts = ["# Antigravity Next Step HUD 快照", ""]
-    if not sessions:
-        md_parts.append("当前暂无已记录的会话状态。")
-    else:
-        for s in sessions[:15]:
-            md_parts.append(format_session_markdown(s))
-            md_parts.append("")
-    LATEST_MD_PATH.write_text("\n".join(md_parts), encoding="utf-8")
-    SNAPSHOT_HTML_PATH.write_text(render_hud_html(sessions, live_sse=False), encoding="utf-8")
-
-
-def render_hud_html(
-    initial_sessions: list[dict[str, Any]] | None = None,
-    live_sse: bool = True,
-    compact: bool = False,
-) -> str:
-    """Render a self-contained light/dark adaptive HTML dashboard (full or compact) for the Next Step HUD."""
-    sessions_json = json.dumps(initial_sessions or [], ensure_ascii=False).replace("</", "<\\/")
-    live_flag = "true" if live_sse else "false"
-    compact_flag = "true" if compact else "false"
-    return f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Next Step HUD · Antigravity</title>
-  <style>
-    :root {{
-      --bg: var(--background, #0f1117);
-      --card-bg: var(--card, #181b23);
-      --border-col: var(--card-border, #2a2f3d);
-      --fg: var(--foreground, #f1f5f9);
-      --muted: var(--muted-foreground, #94a3b8);
-      --accent-col: var(--primary, #38bdf8);
-      --danger: var(--error, #f43f5e);
-      --ok: var(--success, #10b981);
-      --warn: var(--warning, #f59e0b);
-      --code-bg: rgba(15, 23, 42, 0.65);
-    }}
-    @media (prefers-color-scheme: light) {{
-      :root {{
-        --bg: var(--background, #f8fafc);
-        --card-bg: var(--card, #ffffff);
-        --border-col: var(--card-border, #e2e8f0);
-        --fg: var(--foreground, #0f172a);
-        --muted: var(--muted-foreground, #64748b);
-        --accent-col: var(--primary, #0284c7);
-        --code-bg: #f1f5f9;
-      }}
-    }}
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      padding: 14px;
-      background: var(--bg);
-      color: var(--fg);
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-      font-size: 13px;
-      line-height: 1.5;
-    }}
-    body.mode-compact {{ padding: 8px 10px; font-size: 12px; line-height: 1.35; }}
-    .container {{ max-width: 760px; margin: 0 auto; }}
-    .topbar {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-      padding-bottom: 10px;
-      margin-bottom: 12px;
-      border-bottom: 1px solid var(--border-col);
-    }}
-    body.mode-compact .topbar {{ padding-bottom: 6px; margin-bottom: 6px; }}
-    .title {{ font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 8px; }}
-    body.mode-compact .title {{ font-size: 13px; }}
-    .topbar-right {{ display: flex; align-items: center; gap: 6px; }}
-    .mode-btn {{
-      background: var(--card-bg);
-      color: var(--fg);
-      border: 1px solid var(--border-col);
-      border-radius: 999px;
-      padding: 2px 8px;
-      font-size: 11px;
-      cursor: pointer;
-    }}
-    .mode-btn:hover {{ border-color: var(--accent-col); color: var(--accent-col); }}
-    .conn-pill {{
-      font-size: 11px;
-      padding: 2px 8px;
-      border-radius: 999px;
-      border: 1px solid var(--border-col);
-      color: var(--muted);
-    }}
-    .tabs {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-bottom: 12px;
-    }}
-    body.mode-compact .tabs {{ flex-wrap: nowrap; overflow-x: auto; margin-bottom: 6px; padding-bottom: 2px; }}
-    .tab-btn {{
-      background: var(--card-bg);
-      color: var(--fg);
-      border: 1px solid var(--border-col);
-      border-radius: 6px;
-      padding: 5px 10px;
-      font-size: 12px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      white-space: nowrap;
-    }}
-    body.mode-compact .tab-btn {{ padding: 3px 8px; font-size: 11px; }}
-    .tab-btn.active {{
-      border-color: var(--accent-col);
-      box-shadow: 0 0 0 1px var(--accent-col);
-    }}
-    .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }}
-    .dot-wait {{ background: var(--danger); }}
-    .dot-work {{ background: var(--ok); }}
-    .dot-stale {{ background: var(--warn); }}
-    .dot-idle {{ background: var(--muted); }}
-    .card {{
-      background: var(--card-bg);
-      border: 1px solid var(--border-col);
-      border-radius: 10px;
-      padding: 14px 16px;
-      margin-bottom: 12px;
-    }}
-    body.mode-compact .card {{ padding: 8px 10px; margin-bottom: 4px; border-radius: 8px; }}
-    .session-meta {{
-      font-size: 12px;
-      color: var(--muted);
-      margin-bottom: 10px;
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      gap: 6px;
-    }}
-    body.mode-compact .session-meta {{ font-size: 11px; margin-bottom: 6px; }}
-    .grid-3 {{
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-      gap: 10px;
-      margin-bottom: 12px;
-    }}
-    body.mode-compact .grid-3 {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      margin-bottom: 6px;
-    }}
-    .metric-box {{
-      border: 1px solid var(--border-col);
-      border-radius: 8px;
-      padding: 8px 10px;
-    }}
-    body.mode-compact .metric-box {{
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      padding: 3px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-    }}
-    .metric-label {{ font-size: 11px; color: var(--muted); margin-bottom: 3px; }}
-    body.mode-compact .metric-label {{ margin-bottom: 0; font-size: 10px; }}
-    .metric-label::after {{ content: ""; }}
-    body.mode-compact .metric-label::after {{ content: ":"; }}
-    .metric-val {{ font-weight: 600; font-size: 13px; }}
-    body.mode-compact .metric-val {{ font-size: 11px !important; }}
-    .action-box {{
-      border-left: 3px solid var(--accent-col);
-      background: var(--code-bg);
-      padding: 10px 12px;
-      border-radius: 0 8px 8px 0;
-      margin-bottom: 12px;
-    }}
-    body.mode-compact .action-box {{ padding: 6px 10px; margin-bottom: 6px; }}
-    .action-box.waiting {{ border-left-color: var(--danger); }}
-    .action-box.stale {{ border-left-color: var(--warn); }}
-    .action-headline {{ font-size: 15px; font-weight: 700; margin-bottom: 4px; }}
-    body.mode-compact .action-headline {{ font-size: 13px; margin-bottom: 2px; }}
-    .action-detail {{ font-size: 12px; color: var(--muted); }}
-    body.mode-compact .action-detail {{ font-size: 11px; }}
-    .options-list {{ margin: 8px 0 0 0; padding-left: 18px; font-size: 12px; }}
-    .options-list li {{ margin-bottom: 3px; }}
-    .option-chip-row {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }}
-    .opt-copy-btn {{
-      background: var(--card-bg);
-      color: var(--fg);
-      border: 1px solid var(--border-col);
-      border-radius: 6px;
-      padding: 3px 8px;
-      font-size: 11px;
-      cursor: pointer;
-      text-align: left;
-    }}
-    .opt-copy-btn:hover {{ border-color: var(--accent-col); color: var(--accent-col); }}
-    .prompt-box {{
-      border: 1px solid var(--border-col);
-      border-radius: 8px;
-      padding: 10px;
-      background: var(--code-bg);
-      margin-top: 10px;
-    }}
-    body.mode-compact .prompt-box {{
-      padding: 6px 8px;
-      margin-top: 6px;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }}
-    .prompt-header {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      font-size: 11px;
-      color: var(--muted);
-      margin-bottom: 6px;
-    }}
-    body.mode-compact .prompt-header {{ margin-bottom: 0; order: 2; flex-shrink: 0; }}
-    body.mode-compact .prompt-header span {{ display: none; }}
-    .copy-btn {{
-      background: transparent;
-      color: var(--accent-col);
-      border: 1px solid var(--accent-col);
-      border-radius: 5px;
-      padding: 2px 8px;
-      font-size: 11px;
-      cursor: pointer;
-      white-space: nowrap;
-    }}
-    body.mode-compact .copy-btn {{
-      background: var(--accent-col);
-      color: #0b1120;
-      font-weight: 700;
-      padding: 4px 10px;
-    }}
-    .copy-btn:disabled {{
-      opacity: 0.45;
-      cursor: not-allowed;
-    }}
-    pre {{
-      margin: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-      font-size: 12px;
-    }}
-    body.mode-compact pre {{
-      order: 1;
-      flex: 1;
-      font-size: 11px;
-      max-height: 36px;
-      overflow-y: auto;
-    }}
-    .footer-meta {{
-      font-size: 11px;
-      color: var(--muted);
-      display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
-      gap: 8px;
-      border-top: 1px solid var(--border-col);
-      padding-top: 8px;
-      margin-top: 10px;
-    }}
-    body.mode-compact .footer-meta {{ display: none; }}
-    .warn-banner {{
-      background: rgba(245, 158, 11, 0.14);
-      border: 1px solid var(--warn);
-      color: var(--fg);
-      border-radius: 6px;
-      padding: 6px 10px;
-      font-size: 12px;
-      margin-bottom: 10px;
-    }}
-    body.mode-compact .warn-banner {{ padding: 4px 8px; font-size: 11px; margin-bottom: 6px; }}
-  </style>
-</head>
-<body class="{'mode-compact' if compact else ''}">
-  <div class="container">
-    <div class="topbar">
-      <div class="title">
-        <span>Next Step HUD</span>
-        <span id="subtitleText" style="font-weight:400;font-size:11px;color:var(--muted);">只读悬浮提示</span>
-      </div>
-      <div class="topbar-right">
-        <button id="modeToggleBtn" class="mode-btn" onclick="toggleCompactMode()">{'完整视图' if compact else '精简悬浮'}</button>
-        <span id="connStatus" class="conn-pill">初始化中…</span>
-      </div>
-    </div>
-    <div id="sessionTabs" class="tabs"></div>
-    <div id="mainView"></div>
-  </div>
-
-  <script>
-    let sessions = {sessions_json};
-    let selectedId = null;
-    const isLiveSse = {live_flag};
-    let isCompact = {compact_flag};
-    if (window.location && window.location.search && window.location.search.includes('mode=compact')) {{
-      isCompact = true;
-    }}
-
-    function syncCompactClass() {{
-      document.body.classList.toggle('mode-compact', isCompact);
-      const btn = document.getElementById('modeToggleBtn');
-      if (btn) btn.textContent = isCompact ? '完整视图' : '精简悬浮';
-    }}
-
-    window.toggleCompactMode = function() {{
-      isCompact = !isCompact;
-      syncCompactClass();
-      render();
-    }};
-
-    function esc(str) {{
-      const d = document.createElement('div');
-      d.textContent = str == null ? '' : String(str);
-      return d.innerHTML;
-    }}
-
-    function dotClass(s) {{
-      if (s.stale) return 'dot dot-stale';
-      if (s.waitingOnUser) return 'dot dot-wait';
-      if (['WORKING', 'TOOL_RUNNING', 'BACKGROUND_RUNNING'].includes(s.lifecycle)) return 'dot dot-work';
-      return 'dot dot-idle';
-    }}
-
-    function statusText(s) {{
-      if (s.stale) return '🟡 状态可能已过期';
-      if (s.waitingOnUser) {{
-        if (s.lifecycle === 'WAITING_PLAN_REVIEW') return '🔴 等我审阅计划 (Proceed / 评论)';
-        if (s.lifecycle === 'WAITING_USER_DECISION') return '🔴 等我回答选择题';
-        if (s.lifecycle === 'WAITING_USER_APPROVAL') return '🔴 等我授权权限请求';
-        if (s.lifecycle === 'ERROR' || s.lifecycle === 'CANCELED') return '🔴 已中止 / 待介入';
-        return '🔴 等我确认 / 发出指令';
-      }}
-      if (s.lifecycle === 'WORKING' || s.lifecycle === 'TOOL_RUNNING') return '🟢 Agent 运行中（无需操作）';
-      if (s.lifecycle === 'BACKGROUND_RUNNING') return '🟢 后台任务运行中';
-      return '⚪ 会话空闲（无挂起待办）';
-    }}
-
-    function actorText(s) {{
-      const a = (s.actor || '').toLowerCase();
-      if (a === 'user') return '用户';
-      if (a === 'agent') return 'Agent（主会话）';
-      if (a === 'agent_background') return 'Agent（后台任务 / 子 Agent）';
-      if (s.waitingOnUser) return '用户';
-      return '—';
-    }}
-
-    function sourceText(s) {{
-      const st = (s.sourceType || '').toUpperCase();
-      if (st === 'APPROVAL_REQUIRED') return '系统待办 / 审批拦截（确定性事实）';
-      if (st === 'AGENT_DECLARED') return 'Agent 显式声明（高可信）';
-      if (st === 'LIFECYCLE') return '生命周期运行态（系统事实）';
-      return 'Stop 终止态核实（无已声明下一步）';
-    }}
-
-    function wsName(s) {{
-      const list = s.workspacePaths || [];
-      if (!list.length) return 'workspace';
-      const parts = String(list[0]).split('/').filter(Boolean);
-      return parts[parts.length - 1] || list[0];
-    }}
-
-    window.copyText = async function(text, btnEl, origLabel) {{
-      if (!text) return;
-      let copied = false;
-      try {{
-        if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.copyText) {{
-          window.webkit.messageHandlers.copyText.postMessage(String(text));
-          copied = true;
-        }}
-      }} catch (_) {{}}
-
-      if (!copied && navigator.clipboard && navigator.clipboard.writeText) {{
-        try {{
-          await navigator.clipboard.writeText(String(text));
-          copied = true;
-        }} catch (_) {{}}
-      }}
-
-      if (!copied) {{
-        try {{
-          const ta = document.createElement('textarea');
-          ta.value = String(text);
-          ta.style.position = 'fixed';
-          ta.style.opacity = '0';
-          document.body.appendChild(ta);
-          ta.select();
-          copied = document.execCommand('copy');
-          document.body.removeChild(ta);
-        }} catch (_) {{}}
-      }}
-
-      if (copied && btnEl) {{
-        const label = origLabel || btnEl.textContent;
-        btnEl.textContent = '已复制 ✓';
-        setTimeout(() => {{ btnEl.textContent = label; }}, 1400);
-      }}
-    }};
-
-    window.copyOption = function(idx, btnEl) {{
-      const cur = sessions.find(s => s.conversationId === selectedId) || sessions[0];
-      if (!cur || !cur.options || cur.options[idx] == null) return;
-      window.copyText(cur.options[idx], btnEl, btnEl ? btnEl.textContent : '');
-    }};
-
-    function render() {{
-      syncCompactClass();
-      const tabsEl = document.getElementById('sessionTabs');
-      const mainEl = document.getElementById('mainView');
-
-      if (!sessions || !sessions.length) {{
-        tabsEl.innerHTML = '';
-        mainEl.innerHTML = '<div class="card">当前暂无已记录的 Antigravity 会话状态。当会话触发 Hook 或调用 <code>next_step_publish</code> 时将自动显示。</div>';
-        return;
-      }}
-
-      if (!selectedId || !sessions.some(s => s.conversationId === selectedId)) {{
-        selectedId = sessions[0].conversationId;
-      }}
-
-      tabsEl.innerHTML = sessions.map(s => {{
-        const active = s.conversationId === selectedId ? 'active' : '';
-        const shortId = s.shortId || String(s.conversationId).slice(0, 8);
-        return `<button class="tab-btn ${{active}}" onclick="selectSession('${{esc(s.conversationId)}}')">
-          <span class="${{dotClass(s)}}"></span>
-          <span>#${{esc(shortId)}}</span>
-          <span style="color:var(--muted)">${{esc(wsName(s))}}</span>
-        </button>`;
-      }}).join('');
-
-      const cur = sessions.find(s => s.conversationId === selectedId) || sessions[0];
-      const shortId = cur.shortId || String(cur.conversationId).slice(0, 8);
-      const nextHeadline = cur.nextAction
-        ? cur.nextAction
-        : '当前无已声明的下一步（上一轮已正常结束，等待你输入新指令）';
-      const boxCls = cur.stale ? 'action-box stale' : (cur.waitingOnUser ? 'action-box waiting' : 'action-box');
-
-      let staleBanner = '';
-      if (cur.stale && cur.staleReason) {{
-        staleBanner = `<div class="warn-banner">🟡 <strong>过期提示：</strong>${{esc(cur.staleReason)}}</div>`;
-      }}
-      if (cur.activeTool && cur.activeTool.approvalHint) {{
-        staleBanner += `<div class="warn-banner">🟡 <strong>审批提示：</strong>${{esc(cur.activeTool.approvalHint)}}</div>`;
-      }}
-
-      let optionsHtml = '';
-      if (cur.options && cur.options.length) {{
-        if (isCompact) {{
-          optionsHtml = '<div class="option-chip-row">' + cur.options.map((o, i) =>
-            `<button class="opt-copy-btn" title="点击复制此选项" onclick="copyOption(${{i}}, this)">📋 ${{esc(o)}}</button>`
-          ).join('') + '</div>';
-        }} else {{
-          optionsHtml = '<ol class="options-list">' + cur.options.map((o, i) =>
-            `<li>${{esc(o)}} <button class="copy-btn" style="margin-left:6px;" onclick="copyOption(${{i}}, this)">复制</button></li>`
-          ).join('') + '</ol>';
-        }}
-      }}
-
-      let planHtml = '';
-      if (cur.planArtifact && cur.planArtifact.path) {{
-        const pStale = cur.planArtifact.stale ? '🟡 已过期：计划已改写' : '✓ 未过期';
-        planHtml = `<span>关联计划工件：<code>${{esc(cur.planArtifact.name || cur.planArtifact.path)}}</code> (${{pStale}})</span>`;
-      }}
-
-      let promptHtml = '';
-      if (cur.suggestedPrompt) {{
-        const isPromptStale = Boolean(cur.stale || (cur.planArtifact && cur.planArtifact.stale));
-        const disabledAttr = isPromptStale ? 'disabled title="状态已过期，请先确认最新计划"' : '';
-        promptHtml = `<div class="prompt-box">
-          <div class="prompt-header">
-            <span>建议下一条指令（只读展示 · 复制后由你决定是否粘贴提交）</span>
-            <button id="copyBtn" class="copy-btn" ${{disabledAttr}} onclick="copyPrompt()">复制指令</button>
-          </div>
-          <pre id="promptText">${{esc(cur.suggestedPrompt)}}</pre>
-        </div>`;
-      }}
-
-      mainEl.innerHTML = `<div class="card">
-        <div class="session-meta">
-          <span><strong>#${{esc(shortId)}}</strong> · <code>${{esc(wsName(cur))}}</code> · ${{esc(cur.lastUserInput || '尚无用户输入')}}</span>
-          <span>${{esc(cur.updatedAtIso || '')}}</span>
-        </div>
-        ${{staleBanner}}
-        <div class="grid-3">
-          <div class="metric-box">
-            <div class="metric-label">是否在等我</div>
-            <div class="metric-val">${{esc(statusText(cur))}}</div>
-          </div>
-          <div class="metric-box">
-            <div class="metric-label">由谁做</div>
-            <div class="metric-val">${{esc(actorText(cur))}}</div>
-          </div>
-          <div class="metric-box">
-            <div class="metric-label">来源可信度</div>
-            <div class="metric-val" style="font-size:12px;">${{esc(sourceText(cur))}}</div>
-          </div>
-        </div>
-        <div class="${{boxCls}}">
-          <div class="metric-label">接下来要做什么</div>
-          <div class="action-headline">${{esc(nextHeadline)}}</div>
-          ${{cur.detail ? `<div class="action-detail">${{esc(cur.detail)}}</div>` : ''}}
-          ${{optionsHtml}}
-        </div>
-        ${{promptHtml}}
-        <div class="footer-meta">
-          <span>完整会话 ID: <code>${{esc(cur.conversationId)}}</code> (Step #${{esc(cur.stepIdx || 0)}})</span>
-          ${{planHtml}}
-        </div>
-      </div>`;
-    }}
-
-    window.selectSession = function(id) {{
-      selectedId = id;
-      render();
-    }};
-
-    window.copyPrompt = function() {{
-      const cur = sessions.find(s => s.conversationId === selectedId) || sessions[0];
-      if (!cur || !cur.suggestedPrompt) return;
-      const btn = document.getElementById('copyBtn');
-      window.copyText(cur.suggestedPrompt, btn, '复制指令');
-    }};
-
-    async function fetchSessions() {{
-      try {{
-        const res = await fetch('/api/sessions');
-        if (res.ok) {{
-          const data = await res.json();
-          sessions = data.sessions || [];
-          render();
-        }}
-      }} catch (_) {{}}
-    }}
-
-    render();
-
-    const connEl = document.getElementById('connStatus');
-    if (!isLiveSse) {{
-      connEl.textContent = '静态快照模式';
-    }} else if (typeof EventSource !== 'undefined') {{
-      const es = new EventSource('/api/events');
-      es.onopen = () => {{ connEl.textContent = '🟢 实时'; }};
-      es.onmessage = (ev) => {{
-        try {{
-          const data = JSON.parse(ev.data);
-          if (data.sessions) {{
-            sessions = data.sessions;
-            render();
-          }}
-        }} catch (_) {{}}
-      }};
-      es.onerror = () => {{
-        connEl.textContent = '🟡 轮询中';
-      }};
-      setInterval(fetchSessions, 3000);
-    }} else {{
-      connEl.textContent = '轮询模式';
-      setInterval(fetchSessions, 1500);
-    }}
-  </script>
-</body>
-</html>"""

@@ -21,10 +21,22 @@ interface ActiveToolInfo {
   elapsedSec?: number;
 }
 
+interface QuestionPromptItem {
+  question: string;
+  options: string[];
+  multiSelect?: boolean;
+}
+
+interface WorkspaceOption {
+  key: string;
+  label: string;
+}
+
 interface SessionPanelItem {
   conversationId: string;
   shortId: string;
   workspaceName: string;
+  workspaceKey?: string;
   workspacePaths?: string[];
   modelName?: string;
   lastUserInput?: string;
@@ -39,6 +51,7 @@ interface SessionPanelItem {
   nextAction: string | null;
   detail?: string | null;
   options?: string[];
+  questions?: QuestionPromptItem[];
   suggestedPrompt?: string | null;
   copyBlocked?: boolean;
   stale?: boolean;
@@ -58,6 +71,9 @@ interface SidePanelPayload {
   ambiguousPrefix?: boolean;
   selectedSession: SessionPanelItem | null;
   sessions: SessionPanelItem[];
+  workspaceFilter?: string | null;
+  workspaceOptions?: WorkspaceOption[];
+  workspaces?: string[];
   totalSessions?: number;
   waitingCount?: number;
 }
@@ -70,7 +86,7 @@ const MAX_BACKOFF_MS = 12000;
 const rootEl = document.getElementById("app") as HTMLElement;
 
 const app = new App(
-  { name: "NextStepHUD", version: "0.3.0" },
+  { name: "NextStepHUD", version: "0.4.0" },
   {},
   { autoResize: false },
 );
@@ -91,6 +107,10 @@ const state: {
   bindingMode: UiBindingMode;
   hookBoundCid: string | null;
   selectedCid: string | null;
+  backendWorkspaceFilter: string;
+  workspaceFilter: string;
+  knownWorkspaceOptions: WorkspaceOption[];
+  showIdleSessions: boolean;
   payload: SidePanelPayload | null;
 } = {
   connected: false,
@@ -106,8 +126,69 @@ const state: {
   bindingMode: "unbound",
   hookBoundCid: null,
   selectedCid: null,
+  backendWorkspaceFilter: "",
+  workspaceFilter: "",
+  knownWorkspaceOptions: [],
+  showIdleSessions: false,
   payload: null,
 };
+
+function getSessionWorkspaceKey(s: SessionPanelItem): string {
+  if (s.workspaceKey) return s.workspaceKey;
+  if (s.workspacePaths && s.workspacePaths.length > 0 && s.workspacePaths[0]) {
+    return s.workspacePaths[0];
+  }
+  return s.workspaceName || "__none__";
+}
+
+function sessionMatchesWorkspace(s: SessionPanelItem, filterKey: string): boolean {
+  if (!filterKey) return true;
+  const sessionKey = getSessionWorkspaceKey(s);
+  if (filterKey === "__none__") {
+    return sessionKey === "__none__";
+  }
+  if (s.workspaceKey) {
+    return s.workspaceKey === filterKey;
+  }
+  return sessionKey === filterKey || s.workspaceName === filterKey;
+}
+
+function extractBaseWorkspaceName(key: string, label?: string): string {
+  if (key === "__none__") return "未关联工作区";
+  const trimmed = key.replace(/\/+$/, "");
+  const slashIdx = trimmed.lastIndexOf("/");
+  if (slashIdx >= 0 && slashIdx < trimmed.length - 1) {
+    return trimmed.slice(slashIdx + 1);
+  }
+  if (label) {
+    const suffix = ` (${key})`;
+    if (label.endsWith(suffix) && label.length > suffix.length) {
+      return label.slice(0, -suffix.length);
+    }
+    return label;
+  }
+  return trimmed || key;
+}
+
+function recomputeWorkspaceLabels(options: WorkspaceOption[]): WorkspaceOption[] {
+  const bases = new Map<string, string>();
+  const counts = new Map<string, number>();
+  for (const opt of options) {
+    const base = extractBaseWorkspaceName(opt.key, opt.label);
+    bases.set(opt.key, base);
+    if (opt.key !== "__none__") {
+      counts.set(base, (counts.get(base) ?? 0) + 1);
+    }
+  }
+  return options.map((opt) => {
+    if (opt.key === "__none__") {
+      return { key: opt.key, label: "未关联工作区" };
+    }
+    const base = bases.get(opt.key) || opt.label;
+    const needPath = (counts.get(base) ?? 0) > 1 && opt.key !== base;
+    return { key: opt.key, label: needPath ? `${base} (${opt.key})` : base };
+  });
+}
 
 let pollTimer: number | null = null;
 
@@ -188,7 +269,29 @@ function ingestPayload(
   state.pollDelayMs = POLL_INTERVAL_MS;
   state.lastSyncedIso = payload.generatedAtIso ?? new Date().toISOString();
 
+  const incomingBackendWs =
+    typeof payload.workspaceFilter === "string" ? payload.workspaceFilter : "";
+  state.backendWorkspaceFilter = incomingBackendWs;
+  if (payload.workspaceOptions && payload.workspaceOptions.length > 0) {
+    if (!incomingBackendWs) {
+      state.knownWorkspaceOptions = recomputeWorkspaceLabels([...payload.workspaceOptions]);
+    } else {
+      const byKey = new Map<string, string>(
+        state.knownWorkspaceOptions.map((o) => [o.key, o.label]),
+      );
+      for (const opt of payload.workspaceOptions) {
+        if (!byKey.has(opt.key)) {
+          byKey.set(opt.key, opt.label);
+        }
+      }
+      state.knownWorkspaceOptions = recomputeWorkspaceLabels(
+        Array.from(byKey.entries()).map(([key, label]) => ({ key, label })),
+      );
+    }
+  }
+
   if (fromToolResult) {
+    state.workspaceFilter = incomingBackendWs;
     if (payload.bindingMode === "hook_bound" && payload.boundConversationId) {
       state.bindingMode = "hook_bound";
       state.hookBoundCid = payload.boundConversationId;
@@ -201,18 +304,32 @@ function ingestPayload(
       state.selectedCid = null;
     }
   } else {
-    if (
-      state.bindingMode === "hook_bound" &&
-      payload.boundConversationId
-    ) {
-      state.hookBoundCid = payload.boundConversationId;
-      state.selectedCid = payload.boundConversationId;
+    if (state.bindingMode === "hook_bound") {
+      if (
+        payload.boundConversationId &&
+        !matchesCid(payload.boundConversationId, state.hookBoundCid)
+      ) {
+        state.payload = {
+          ...payload,
+          boundConversationId: state.hookBoundCid,
+          sessionNotFound: true,
+          selectedSession: null,
+        };
+      }
     } else if (state.bindingMode === "user_selected") {
       if (payload.ambiguousPrefix) {
         state.bindingMode = "unbound";
         state.selectedCid = null;
-      } else if (payload.boundConversationId) {
-        state.selectedCid = payload.boundConversationId;
+      } else if (
+        payload.boundConversationId &&
+        !matchesCid(payload.boundConversationId, state.selectedCid)
+      ) {
+        state.payload = {
+          ...payload,
+          boundConversationId: state.selectedCid,
+          sessionNotFound: true,
+          selectedSession: null,
+        };
       }
     }
   }
@@ -329,6 +446,7 @@ async function refreshFromServer(trigger: RefreshTrigger): Promise<void> {
   const gen = state.refreshGeneration;
   const reqMode = state.bindingMode;
   const reqCid = reqMode !== "unbound" ? state.selectedCid : null;
+  const reqWs = state.workspaceFilter;
   state.inFlight = true;
   if (trigger === "manual" || trigger === "select") {
     render();
@@ -338,6 +456,9 @@ async function refreshFromServer(trigger: RefreshTrigger): Promise<void> {
   if (reqCid) {
     args.conversation_id = reqCid;
   }
+  if (reqWs) {
+    args.workspace_path = reqWs;
+  }
 
   try {
     const res = await app.callServerTool({
@@ -346,6 +467,7 @@ async function refreshFromServer(trigger: RefreshTrigger): Promise<void> {
     });
     const stillMatchesSelection =
       gen === state.refreshGeneration &&
+      reqWs === state.workspaceFilter &&
       (reqCid === null
         ? state.bindingMode === "unbound"
         : state.bindingMode !== "unbound" && reqCid === state.selectedCid);
@@ -368,6 +490,7 @@ async function refreshFromServer(trigger: RefreshTrigger): Promise<void> {
   } catch (err) {
     const stillMatchesSelection =
       gen === state.refreshGeneration &&
+      reqWs === state.workspaceFilter &&
       (reqCid === null
         ? state.bindingMode === "unbound"
         : state.bindingMode !== "unbound" && reqCid === state.selectedCid);
@@ -420,51 +543,149 @@ function restoreHookBound(): void {
   void refreshFromServer("select");
 }
 
-function renderSessionList(sessions: SessionPanelItem[]): HTMLElement {
+function renderSessionItemButton(
+  s: SessionPanelItem,
+  wsLabelMap?: Map<string, string>,
+): HTMLButtonElement {
+  const cls = s.stale
+    ? "ns-session-item stale"
+    : s.waitingOnUser
+      ? "ns-session-item waiting"
+      : "ns-session-item";
+  const btn = el("button", cls);
+  btn.type = "button";
+  btn.onclick = () => selectSession(s.conversationId);
+
+  const wsLabel =
+    wsLabelMap?.get(getSessionWorkspaceKey(s)) || s.workspaceName;
+  const top = el("div", "ns-session-top");
+  top.appendChild(
+    el("span", "ns-mono", `#${s.shortId} · ${wsLabel}`),
+  );
+  top.appendChild(el("span", "", s.statusBadge));
+  btn.appendChild(top);
+
+  const actionPreview =
+    s.nextAction || "当前无已声明的下一步（空闲）";
+  btn.appendChild(
+    el("div", "ns-session-sub", `下一步: ${actionPreview}`),
+  );
+
+  const metaParts: string[] = [];
+  if (s.lastUserInput) metaParts.push(`输入: ${s.lastUserInput}`);
+  if (s.updatedAtIso) metaParts.push(s.updatedAtIso);
+  if (metaParts.length) {
+    btn.appendChild(el("div", "ns-session-sub", metaParts.join(" · ")));
+  }
+  return btn;
+}
+
+function appendSessionGroup(
+  wrap: HTMLElement,
+  title: string,
+  items: SessionPanelItem[],
+  wsLabelMap?: Map<string, string>,
+): void {
+  if (!items.length) return;
+  wrap.appendChild(el("div", "ns-group-title", title));
+  for (const s of items) {
+    wrap.appendChild(renderSessionItemButton(s, wsLabelMap));
+  }
+}
+
+function renderSessionList(
+  sessions: SessionPanelItem[],
+  wsLabelMap?: Map<string, string>,
+): HTMLElement {
   const wrap = el("div", "ns-session-list");
   if (!sessions.length) {
+    if (
+      (state.inFlight || state.pendingRefreshTrigger !== null) &&
+      state.backendWorkspaceFilter !== state.workspaceFilter
+    ) {
+      wrap.appendChild(
+        el("div", "ns-banner ns-banner-info", "正在加载所选工作区的会话状态..."),
+      );
+      return wrap;
+    }
+    const activeLabel =
+      (state.workspaceFilter && wsLabelMap?.get(state.workspaceFilter)) ||
+      (state.workspaceFilter === "__none__" ? "未关联工作区" : state.workspaceFilter);
     wrap.appendChild(
       el(
         "div",
         "ns-banner ns-banner-info",
-        "当前尚无已记录的会话状态。发送消息或调用 next_step_publish / next_step_side_panel 后会出现在这里。",
+        state.workspaceFilter
+          ? `工作区「${activeLabel}」下暂无已记录的会话状态，可切换回「全部工作区」查看。`
+          : "当前尚无已记录的会话状态。发送消息或调用 next_step_publish / next_step_side_panel 后会出现在这里。",
       ),
     );
     return wrap;
   }
 
+  const waitingGroup: SessionPanelItem[] = [];
+  const activeGroup: SessionPanelItem[] = [];
+  const idleGroup: SessionPanelItem[] = [];
   for (const s of sessions) {
-    const cls = s.stale
-      ? "ns-session-item stale"
-      : s.waitingOnUser
-        ? "ns-session-item waiting"
-        : "ns-session-item";
-    const btn = el("button", cls);
-    btn.type = "button";
-    btn.onclick = () => selectSession(s.conversationId);
-
-    const top = el("div", "ns-session-top");
-    top.appendChild(
-      el("span", "ns-mono", `#${s.shortId} · ${s.workspaceName}`),
-    );
-    top.appendChild(el("span", "", s.statusBadge));
-    btn.appendChild(top);
-
-    const actionPreview =
-      s.nextAction || "当前无已声明的下一步（空闲）";
-    btn.appendChild(
-      el("div", "ns-session-sub", `下一步: ${actionPreview}`),
-    );
-
-    const metaParts: string[] = [];
-    if (s.lastUserInput) metaParts.push(`输入: ${s.lastUserInput}`);
-    if (s.updatedAtIso) metaParts.push(s.updatedAtIso);
-    if (metaParts.length) {
-      btn.appendChild(el("div", "ns-session-sub", metaParts.join(" · ")));
+    if (s.waitingOnUser) {
+      waitingGroup.push(s);
+    } else if (
+      s.stale ||
+      s.lifecycle === "WORKING" ||
+      s.lifecycle === "TOOL_RUNNING" ||
+      s.lifecycle === "BACKGROUND_RUNNING"
+    ) {
+      activeGroup.push(s);
+    } else {
+      idleGroup.push(s);
     }
-    wrap.appendChild(btn);
+  }
+
+  appendSessionGroup(wrap, `🔴 待我处理 (${waitingGroup.length})`, waitingGroup, wsLabelMap);
+  appendSessionGroup(wrap, `🟢 运行中 / 待核验 (${activeGroup.length})`, activeGroup, wsLabelMap);
+
+  if (idleGroup.length > 0) {
+    const toggleBtn = el(
+      "button",
+      "ns-btn ns-idle-toggle",
+      state.showIdleSessions
+        ? `收起历史空闲会话 (${idleGroup.length})`
+        : `展开历史空闲会话 (${idleGroup.length})`,
+    );
+    toggleBtn.type = "button";
+    toggleBtn.onclick = () => {
+      state.showIdleSessions = !state.showIdleSessions;
+      render();
+    };
+    wrap.appendChild(toggleBtn);
+    if (state.showIdleSessions) {
+      appendSessionGroup(wrap, `⚪ 历史空闲 (${idleGroup.length})`, idleGroup, wsLabelMap);
+    }
   }
   return wrap;
+}
+
+function renderOptionRow(
+  optText: string,
+  copyBlocked: boolean,
+  isStale: boolean,
+  optHint: HTMLElement,
+): HTMLElement {
+  const row = el("div", "ns-opt-item");
+  const span = el("span", "ns-opt-text", optText);
+  const copyBtn = el("button", "ns-btn", "复制选项");
+  copyBtn.type = "button";
+  if (copyBlocked) {
+    copyBtn.disabled = true;
+    copyBtn.title = isStale
+      ? "计划或状态已过期，已阻止直接复制"
+      : "最近一次状态刷新失败，无法核验新鲜度";
+  } else {
+    copyBtn.onclick = () => void copyTextSafely(optText, copyBtn, optHint, span);
+  }
+  row.appendChild(span);
+  row.appendChild(copyBtn);
+  return row;
 }
 
 function renderSessionDetail(s: SessionPanelItem): HTMLElement {
@@ -570,7 +791,30 @@ function renderSessionDetail(s: SessionPanelItem): HTMLElement {
   }
   card.appendChild(actionBox);
 
-  if (s.options && s.options.length > 0) {
+  const qList = s.questions && s.questions.length > 0 ? s.questions : [];
+  if (qList.length > 1) {
+    const optSection = el("div", "ns-options");
+    optSection.appendChild(
+      el(
+        "div",
+        "ns-section-label",
+        `待选确认项（系统拦截 · 共 ${qList.length} 个问题）`,
+      ),
+    );
+    const optHint = el("div", "ns-copy-hint");
+    for (let i = 0; i < qList.length; i++) {
+      const qItem = qList[i];
+      const qBlock = el("div", "ns-q-block");
+      const qTitle = `Q${i + 1}. ${qItem.question}${qItem.multiSelect ? "（可多选）" : ""}`;
+      qBlock.appendChild(el("div", "ns-q-title", qTitle));
+      for (const optText of qItem.options || []) {
+        qBlock.appendChild(renderOptionRow(optText, copyBlocked, isStale, optHint));
+      }
+      optSection.appendChild(qBlock);
+    }
+    optSection.appendChild(optHint);
+    card.appendChild(optSection);
+  } else if (s.options && s.options.length > 0) {
     const optSection = el("div", "ns-options");
     optSection.appendChild(
       el(
@@ -581,21 +825,7 @@ function renderSessionDetail(s: SessionPanelItem): HTMLElement {
     );
     const optHint = el("div", "ns-copy-hint");
     for (const optText of s.options) {
-      const row = el("div", "ns-opt-item");
-      const span = el("span", "ns-opt-text", optText);
-      const copyBtn = el("button", "ns-btn", "复制选项");
-      copyBtn.type = "button";
-      if (copyBlocked) {
-        copyBtn.disabled = true;
-        copyBtn.title = isStale
-          ? "计划或状态已过期，已阻止直接复制"
-          : "最近一次状态刷新失败，无法核验新鲜度";
-      } else {
-        copyBtn.onclick = () => void copyTextSafely(optText, copyBtn, optHint, span);
-      }
-      row.appendChild(span);
-      row.appendChild(copyBtn);
-      optSection.appendChild(row);
+      optSection.appendChild(renderOptionRow(optText, copyBlocked, isStale, optHint));
     }
     optSection.appendChild(optHint);
     card.appendChild(optSection);
@@ -687,7 +917,7 @@ function render(): void {
   const header = el("div", "ns-header");
   const titleRow = el("div", "ns-title-row");
   titleRow.appendChild(el("h1", "ns-title", "Next Step HUD"));
-  titleRow.appendChild(el("span", "ns-ver", state.payload?.version ? `v${state.payload.version}` : "v0.3.0"));
+  titleRow.appendChild(el("span", "ns-ver", state.payload?.version ? `v${state.payload.version}` : "v0.4.0"));
   header.appendChild(titleRow);
 
   const toolbar = el("div", "ns-toolbar");
@@ -725,6 +955,59 @@ function render(): void {
   }
 
   const sessions = state.payload?.sessions ?? [];
+  const wsOptions: WorkspaceOption[] = [];
+  const seenWsKeys = new Set<string>();
+  const addWsOpt = (key: string, label: string): void => {
+    if (!key || seenWsKeys.has(key)) return;
+    seenWsKeys.add(key);
+    wsOptions.push({ key, label });
+  };
+  if (state.knownWorkspaceOptions.length > 0 || (state.payload?.workspaceOptions && state.payload.workspaceOptions.length > 0)) {
+    for (const opt of state.knownWorkspaceOptions) {
+      addWsOpt(opt.key, opt.label);
+    }
+    for (const opt of state.payload?.workspaceOptions ?? []) {
+      addWsOpt(opt.key, opt.label);
+    }
+  } else if (state.payload?.workspaces && state.payload.workspaces.length > 0) {
+    for (const w of state.payload.workspaces) {
+      addWsOpt(w, w);
+    }
+  } else {
+    const keyCounts = new Map<string, number>();
+    const rawKeys = Array.from(new Set(sessions.map((s) => getSessionWorkspaceKey(s))));
+    for (const k of rawKeys) {
+      if (k === "__none__") continue;
+      const nm = sessions.find((s) => getSessionWorkspaceKey(s) === k)?.workspaceName || k;
+      keyCounts.set(nm, (keyCounts.get(nm) ?? 0) + 1);
+    }
+    for (const k of rawKeys.sort()) {
+      if (k === "__none__") continue;
+      const nm = sessions.find((s) => getSessionWorkspaceKey(s) === k)?.workspaceName || k;
+      addWsOpt(k, (keyCounts.get(nm) ?? 0) > 1 ? `${nm} (${k})` : nm);
+    }
+    if (rawKeys.includes("__none__")) {
+      addWsOpt("__none__", "未关联工作区");
+    }
+  }
+  if (state.workspaceFilter && !seenWsKeys.has(state.workspaceFilter)) {
+    addWsOpt(
+      state.workspaceFilter,
+      state.workspaceFilter === "__none__" ? "未关联工作区" : state.workspaceFilter,
+    );
+  }
+  const hasCanonicalWsOpts =
+    state.knownWorkspaceOptions.length > 0 ||
+    Boolean(state.payload?.workspaceOptions && state.payload.workspaceOptions.length > 0);
+  if (hasCanonicalWsOpts) {
+    const disambiguated = recomputeWorkspaceLabels(wsOptions);
+    wsOptions.splice(0, wsOptions.length, ...disambiguated);
+  }
+  const wsLabelMap = new Map(wsOptions.map((o) => [o.key, o.label]));
+  const visibleSessions = state.workspaceFilter
+    ? sessions.filter((s) => sessionMatchesWorkspace(s, state.workspaceFilter))
+    : sessions;
+
   const bindingBar = el("div", "ns-binding-bar");
   const bindingTop = el("div", "ns-binding-top");
 
@@ -768,17 +1051,18 @@ function render(): void {
       "option",
       "",
       state.bindingMode === "unbound"
-        ? `-- 请显式选择会话（共 ${sessions.length} 个，不自动猜测） --`
-        : `-- 切换查看其他会话（共 ${sessions.length} 个） --`,
+        ? `-- 请显式选择会话（共 ${visibleSessions.length} 个，不自动猜测） --`
+        : `-- 切换查看其他会话（共 ${visibleSessions.length} 个） --`,
     );
     placeholder.value = "";
     select.appendChild(placeholder);
 
-    for (const s of sessions) {
+    for (const s of visibleSessions) {
       const opt = document.createElement("option");
       opt.value = s.conversationId;
       const waitTag = s.stale ? "🟡" : s.waitingOnUser ? "🔴" : "⚪";
-      opt.textContent = `${waitTag} #${s.shortId} (${s.workspaceName}) - ${s.nextAction || "空闲"}`;
+      const wsLbl = wsLabelMap.get(getSessionWorkspaceKey(s)) || s.workspaceName;
+      opt.textContent = `${waitTag} #${s.shortId} (${wsLbl}) - ${s.nextAction || "空闲"}`;
       if (state.bindingMode !== "unbound" && s.conversationId === state.selectedCid) {
         opt.selected = true;
       }
@@ -792,6 +1076,37 @@ function render(): void {
       }
     };
     bindingBar.appendChild(select);
+  }
+
+  if (wsOptions.length > 1 || state.workspaceFilter || state.backendWorkspaceFilter) {
+    const wsSelect = el("select", "ns-select ns-ws-select");
+    wsSelect.setAttribute("aria-label", "按工作区筛选会话");
+    const allOpt = el("option", "", `全部工作区 (${sessions.length})`);
+    allOpt.value = "";
+    if (!state.workspaceFilter) allOpt.selected = true;
+    wsSelect.appendChild(allOpt);
+    for (const wsOpt of wsOptions) {
+      const count = sessions.filter((s) => sessionMatchesWorkspace(s, wsOpt.key)).length;
+      const showCount = !state.backendWorkspaceFilter || wsOpt.key === state.backendWorkspaceFilter;
+      const baseLabel = wsOpt.key === "__none__" ? "未关联工作区" : `工作区: ${wsOpt.label}`;
+      const opt = el("option", "", showCount ? `${baseLabel} (${count})` : baseLabel);
+      opt.value = wsOpt.key;
+      if (state.workspaceFilter === wsOpt.key) opt.selected = true;
+      wsSelect.appendChild(opt);
+    }
+    wsSelect.onchange = () => {
+      const nextVal = wsSelect.value;
+      const needsServerFetch =
+        Boolean(state.backendWorkspaceFilter) && nextVal !== state.backendWorkspaceFilter;
+      state.workspaceFilter = nextVal;
+      if (needsServerFetch) {
+        state.refreshGeneration++;
+        void refreshFromServer("select");
+      } else {
+        render();
+      }
+    };
+    bindingBar.appendChild(wsSelect);
   }
   container.appendChild(bindingBar);
 
@@ -822,7 +1137,7 @@ function render(): void {
         "当前未收到会话绑定上下文（例如从面板菜单手动打开，或存在同名冲突）。请从下方列表手动点击会话以查看，系统不会擅自猜测最近会话。",
       ),
     );
-    container.appendChild(renderSessionList(sessions));
+    container.appendChild(renderSessionList(visibleSessions, wsLabelMap));
   } else if (matchedNotFound) {
     const missingCid = state.selectedCid || curPayload?.boundConversationId || "未知";
     container.appendChild(
@@ -832,9 +1147,9 @@ function render(): void {
         `已绑定会话 #${missingCid.slice(0, 8)}，但后端尚无该会话的状态记录（尚未触发 Hook 或发布下一步），未越权展示其他会话数据。`,
       ),
     );
-    if (sessions.length > 0) {
+    if (visibleSessions.length > 0) {
       container.appendChild(el("div", "ns-section-label", "其他已记录会话（需点击才会切换）："));
-      container.appendChild(renderSessionList(sessions));
+      container.appendChild(renderSessionList(visibleSessions, wsLabelMap));
     }
   } else if (matchedSelectedSession) {
     container.appendChild(renderSessionDetail(matchedSelectedSession));
@@ -850,7 +1165,7 @@ function render(): void {
       ),
     );
   } else {
-    container.appendChild(renderSessionList(sessions));
+    container.appendChild(renderSessionList(visibleSessions, wsLabelMap));
   }
 
   const statusLine = el("div", "ns-status-line");
@@ -869,6 +1184,10 @@ function render(): void {
 app.ontoolinput = () => {
   cancelPendingPoll();
   invalidateHostBinding();
+  state.backendWorkspaceFilter = "";
+  state.workspaceFilter = "";
+  state.knownWorkspaceOptions = [];
+  state.showIdleSessions = false;
   state.loading = true;
   state.lastError = null;
   render();

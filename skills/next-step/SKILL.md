@@ -12,8 +12,8 @@ Use the `next-step` MCP tools to inspect, open, or publish the current session's
 
 1. **Open the MCP Apps Side Panel (`next_step_side_panel`, primary in Antigravity App)**:
    - Call `next_step_side_panel` (`{}` — `PreToolUse` binds the active `conversationId` automatically) to open/refresh the native Antigravity Side Panel (`aux_pane`, `ui://next-step/side-panel.html`) beside the conversation. Non-UI clients receive the same clean Markdown summary as plain text.
-2. **Inspect status & open Web/macOS HUD (`next_step_get`)**:
-   - Call `next_step_get` (with `ensure_hud: true`, and `open_window: true` on macOS when the user explicitly asks to open/float the external macOS window) to query active sessions sorted by `waitingOnUser` and recency, evaluate plan artifact SHA-256 staleness, obtain the local read-only SSE HUD URL (`http://127.0.0.1:<port>/`), and open/surface the native always-on-top non-activating floating HUD panel.
+2. **Inspect status as Markdown (`next_step_get`)**:
+   - Call `next_step_get` to query active sessions sorted by `waitingOnUser` and recency (or inspect a specific `conversation_id` / `workspace_path`) and check plan artifact SHA-256 staleness in Markdown.
 3. **Publish an explicit next step (`next_step_publish`)**:
    - Call `next_step_publish` with `next_action`, `actor` (`"user" | "agent" | "agent_background"`), `waiting_on_user` (`true` or `false`), and optional `suggested_prompt`, `detail`, and `plan_path`.
 4. **Read-only guarantee**:

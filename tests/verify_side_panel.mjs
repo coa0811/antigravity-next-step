@@ -257,11 +257,12 @@ const quietConsole = {
   error: console.error,
 };
 
+const fakeNavigator = {};
 const context = vm.createContext({
   window: fakeWindow,
   self: fakeWindow,
   document: fakeDocument,
-  navigator: {},
+  navigator: fakeNavigator,
   console: quietConsole,
   setTimeout: fakeSetTimeout,
   clearTimeout: fakeClearTimeout,
@@ -355,6 +356,12 @@ function findCards() {
   return appRoot.findAll(
     (n) => typeof n.className === "string" && n.className.split(/\s+/).includes("ns-card"),
   );
+}
+
+function findSessionListEl() {
+  return appRoot.findAll(
+    (n) => typeof n.className === "string" && n.className.split(/\s+/).includes("ns-session-list"),
+  )[0];
 }
 
 function findButtonsByText(label) {
@@ -724,5 +731,662 @@ assert.equal(blockedBtns.length, 1);
 assert.equal(blockedBtns[0].disabled, true);
 assert.equal(findButtonsByText("复制指令").length, 0);
 console.log("[PASS] 6. Stale plan disables prompt copying ('已过期 · 禁止复制', disabled=true)");
+
+// 7. Grouped overview (collapsing idle sessions), workspace filtering without auto-binding, & multi-question rendering
+const waitAlpha = makeSessionItem("cid-wait-alpha", "Answer Alpha", "Prompt Alpha", {
+  workspaceName: "repo-alpha",
+});
+const workAlpha = {
+  ...makeSessionItem("cid-work-alpha", "Working Alpha", null, { workspaceName: "repo-alpha" }),
+  lifecycle: "WORKING",
+  waitingOnUser: false,
+  statusBadge: "🟢 Agent 运行中 (WORKING)",
+  actor: "agent",
+  actorLabel: "Agent（主会话）",
+};
+const idleAlpha = {
+  ...makeSessionItem("cid-idle-alpha", null, null, { workspaceName: "repo-alpha" }),
+  lifecycle: "IDLE",
+  sourceType: "NONE",
+  waitingOnUser: false,
+  statusBadge: "⚪ 会话空闲（无挂起待办）",
+  actor: "none",
+  actorLabel: "—",
+};
+const waitBeta = makeSessionItem("cid-wait-beta", "Answer Beta", "Prompt Beta", {
+  workspaceName: "repo-beta",
+});
+const multiQSession = {
+  ...makeSessionItem("cid-multi-q", "在聊天框回答选择题：选择环境（共 2 个问题）", null, {
+    workspaceName: "repo-alpha",
+  }),
+  sourceType: "APPROVAL_REQUIRED",
+  lifecycle: "WAITING_USER_DECISION",
+  options: ["[Q1] Dev", "[Q1] Prod", "[Q2] Skip tests", "[Q2] Full tests"],
+  questions: [
+    { question: "选择目标环境", options: ["Dev", "Prod"], multiSelect: false },
+    { question: "选择测试档位", options: ["Skip tests", "Full tests"], multiSelect: true },
+  ],
+};
+const mixedSessions = [waitAlpha, workAlpha, idleAlpha, waitBeta, multiQSession];
+
+// Reset to unbound with mixed multi-workspace sessions
+sendHostNotification("ui/notifications/tool-input", { arguments: {} });
+await flushMicrotasks();
+sendHostNotification("ui/notifications/tool-result", {
+  content: [{ type: "text", text: "unbound mixed" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: mixedSessions,
+    }),
+    workspaces: ["repo-alpha", "repo-beta"],
+  },
+});
+await flushMicrotasks();
+
+// Idle session should be collapsed initially inside .ns-session-list behind "展开历史空闲会话 (1)"
+const listCollapsed = findSessionListEl();
+assert.ok(listCollapsed, "Session list container missing");
+assert.ok(listCollapsed.textContent.includes("🔴 待我处理"), "Missing waiting group title");
+assert.ok(listCollapsed.textContent.includes("🟢 运行中 / 待核验"), "Missing active group title");
+assert.ok(!listCollapsed.textContent.includes("#cid-idle"), "Idle session should be hidden while collapsed");
+const toggleIdleBtn = findButtonsByText("展开历史空闲会话 (1)")[0];
+assert.ok(toggleIdleBtn, "Expected idle session collapse toggle button");
+toggleIdleBtn.onclick();
+await flushMicrotasks();
+assert.ok(findSessionListEl().textContent.includes("#cid-idle"), "Idle session should appear after expanding toggle");
+
+// Filtering by workspace "repo-beta" must narrow list WITHOUT binding or showing copy buttons
+const wsSelect = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+assert.ok(wsSelect, "Workspace filter <select> missing");
+wsSelect.value = "repo-beta";
+wsSelect.onchange();
+await flushMicrotasks();
+
+assert.ok(renderedText().includes("未绑定会话"), "Workspace filter must NEVER auto-bind");
+assert.equal(findCards().length, 0, "Workspace filter must NOT render detail card");
+const filteredList = findSessionListEl();
+assert.ok(filteredList.textContent.includes("Answer Beta"), "Filtered repo-beta session missing");
+assert.ok(!filteredList.textContent.includes("Working Alpha"), "repo-alpha session should be filtered out");
+
+// Clear filter back to all workspaces before checking multi-question detail
+const wsSelect2 = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+wsSelect2.value = "";
+wsSelect2.onchange();
+await flushMicrotasks();
+
+// Select multiQSession and confirm both Q1 & Q2 + all option copy buttons render and lock on refresh failure
+const sessSelect7 = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "选择 Antigravity 会话",
+)[0];
+sessSelect7.value = "cid-multi-q";
+sessSelect7.onchange();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1);
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "multi-q" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "explicit",
+      boundConversationId: "cid-multi-q",
+      selectedSession: multiQSession,
+      sessions: mixedSessions,
+    }),
+    workspaces: ["repo-alpha", "repo-beta"],
+  },
+});
+await flushMicrotasks();
+
+assert.ok(renderedText().includes("Q1. 选择目标环境"), "Q1 title missing");
+assert.ok(renderedText().includes("Q2. 选择测试档位（可多选）"), "Q2 title missing");
+const multiOptBtns = findButtonsByText("复制选项");
+assert.equal(multiOptBtns.length, 4, "Expected all 4 option copy buttons across Q1 and Q2");
+assert.ok(multiOptBtns.every((b) => !b.disabled), "Option copy buttons should be enabled when verified");
+
+findButtonsByText("刷新")[0].onclick();
+await flushMicrotasks();
+pendingToolCalls.shift().reject("refresh error on multi-q");
+await flushMicrotasks();
+assert.ok(
+  findButtonsByText("复制选项").every((b) => b.disabled),
+  "All multi-question option copy buttons must disable after refresh failure",
+);
+console.log("[PASS] 7. Grouped/collapsible idle list, workspace filter (no auto-bind), & multi-question copy controls");
+
+// 8. Disambiguated workspace keys, caller workspace_path preserved across poll/manual refresh & cleared on All, idle-only collapse, & untruncated Q10 copy
+const idleFooProj = {
+  ...makeSessionItem("cid-fp01-idle", null, null, { workspaceName: "foo" }),
+  workspaceKey: "/projects/foo",
+  workspacePaths: ["/projects/foo"],
+  lifecycle: "IDLE",
+  sourceType: "NONE",
+  waitingOnUser: false,
+  statusBadge: "⚪ 会话空闲（无挂起待办）",
+  actor: "none",
+  actorLabel: "—",
+};
+const idleFooWork = {
+  ...makeSessionItem("cid-fw02-idle", null, null, { workspaceName: "foo" }),
+  workspaceKey: "/work/foo",
+  workspacePaths: ["/work/foo"],
+  lifecycle: "IDLE",
+  sourceType: "NONE",
+  waitingOnUser: false,
+  statusBadge: "⚪ 会话空闲（无挂起待办）",
+  actor: "none",
+  actorLabel: "—",
+};
+const idleNoWs = {
+  ...makeSessionItem("cid-nw03-idle", null, null, { workspaceName: "未关联工作区" }),
+  workspaceKey: "__none__",
+  workspacePaths: [],
+  lifecycle: "IDLE",
+  sourceType: "NONE",
+  waitingOnUser: false,
+  statusBadge: "⚪ 会话空闲（无挂起待办）",
+  actor: "none",
+  actorLabel: "—",
+};
+const disambigOpts = [
+  { key: "/projects/foo", label: "foo (/projects/foo)" },
+  { key: "/work/foo", label: "foo (/work/foo)" },
+  { key: "__none__", label: "未关联工作区" },
+];
+
+// 8a. All idle sessions + caller workspace_path filter starts collapsed and retains workspace_path across poll & manual refresh
+sendHostNotification("ui/notifications/tool-input", { arguments: { workspace_path: "/projects/foo" } });
+await flushMicrotasks();
+sendHostNotification("ui/notifications/tool-result", {
+  content: [{ type: "text", text: "filtered idle" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooProj],
+    }),
+    workspaceFilter: "/projects/foo",
+    workspaceOptions: [{ key: "/projects/foo", label: "foo (/projects/foo)" }],
+  },
+});
+await flushMicrotasks();
+
+assert.ok(renderedText().includes("未绑定会话"), "Idle-only view must stay unbound");
+assert.ok(!findSessionListEl().textContent.includes("#cid-fp01"), "Idle-only list must be collapsed by default");
+const idleOnlyBtn = findButtonsByText("展开历史空闲会话 (1)")[0];
+assert.ok(idleOnlyBtn, "Idle-only view must show collapse toggle");
+idleOnlyBtn.onclick();
+await flushMicrotasks();
+assert.ok(findSessionListEl().textContent.includes("#cid-fp01"), "Idle-only list should expand on click");
+assert.ok(renderedText().includes("未绑定会话"), "Expanding idle group must not change binding");
+const recollapseBtn = findButtonsByText("收起历史空闲会话 (1)")[0];
+assert.ok(recollapseBtn, "Expected collapse button after expand");
+recollapseBtn.onclick();
+await flushMicrotasks();
+assert.ok(!findSessionListEl().textContent.includes("#cid-fp01"), "Idle-only list should re-collapse cleanly");
+
+// Auto-poll retains workspace_path
+const pollTimer8 = Array.from(activeTimers.values()).find((t) => t.delay >= 3000);
+assert.ok(pollTimer8, "Expected active poll timer for workspace retention test");
+pollTimer8.fn();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1);
+assert.deepEqual(pendingToolCalls[0].arguments, { workspace_path: "/projects/foo" });
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "poll filtered" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooProj, idleFooWork, idleNoWs],
+    }),
+    workspaceFilter: "/projects/foo",
+    workspaceOptions: disambigOpts,
+  },
+});
+await flushMicrotasks();
+
+// Manual refresh also retains workspace_path
+findButtonsByText("刷新")[0].onclick();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1);
+assert.deepEqual(pendingToolCalls[0].arguments, { workspace_path: "/projects/foo" });
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "manual filtered" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooProj, idleFooWork, idleNoWs],
+    }),
+    workspaceFilter: "/projects/foo",
+    workspaceOptions: disambigOpts,
+  },
+});
+await flushMicrotasks();
+
+// Check disambiguated workspace dropdown + distinct __none__ option vs ""
+const wsSel8 = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+const wsVals8 = wsSel8.children.map((o) => o.value);
+assert.ok(wsVals8.includes(""), "All-workspaces empty option missing");
+assert.ok(wsVals8.includes("/projects/foo"), "Canonical /projects/foo option missing");
+assert.ok(wsVals8.includes("/work/foo"), "Canonical /work/foo option missing");
+assert.ok(wsVals8.includes("__none__"), "Distinct __none__ option missing");
+assert.ok(wsSel8.children.some((o) => o._text.includes("foo (/projects/foo)")));
+assert.ok(wsSel8.children.some((o) => o._text.includes("foo (/work/foo)")));
+
+// Switching back to "" (全部工作区) clears backend workspace constraint and refreshes without workspace_path
+wsSel8.value = "";
+wsSel8.onchange();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1, "Clearing backend workspace filter should trigger refresh");
+assert.deepEqual(pendingToolCalls[0].arguments, {});
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "all cleared" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooProj, idleFooWork, idleNoWs],
+    }),
+    workspaceFilter: null,
+    workspaceOptions: disambigOpts,
+  },
+});
+await flushMicrotasks();
+
+// 8a-2. Selecting /work/foo from "All Workspaces" must NOT match parent /work and must retain /work/foo on manual refresh
+const idleWorkParent = {
+  ...makeSessionItem("cid-wk01-work", null, null, { workspaceName: "work" }),
+  workspaceKey: "/work",
+  workspacePaths: ["/work"],
+  nextAction: "Parent Work Session",
+  lifecycle: "IDLE",
+  sourceType: "NONE",
+  waitingOnUser: false,
+  statusBadge: "⚪ 会话空闲（无挂起待办）",
+  actor: "none",
+  actorLabel: "—",
+};
+const disambigWithParent = [
+  ...disambigOpts,
+  { key: "/work", label: "work" },
+];
+sendHostNotification("ui/notifications/tool-input", { arguments: {} });
+await flushMicrotasks();
+sendHostNotification("ui/notifications/tool-result", {
+  content: [{ type: "text", text: "all with /work parent" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooProj, idleFooWork, idleWorkParent, idleNoWs],
+    }),
+    workspaceFilter: null,
+    workspaceOptions: disambigWithParent,
+  },
+});
+await flushMicrotasks();
+
+const wsSelFromAll = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+wsSelFromAll.value = "/work/foo";
+wsSelFromAll.onchange();
+await flushMicrotasks();
+
+const sessOptsWorkFoo = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "选择 Antigravity 会话",
+)[0].children.map((o) => o.value);
+assert.ok(sessOptsWorkFoo.includes("cid-fw02-idle"), "/work/foo session must appear under /work/foo filter");
+assert.ok(!sessOptsWorkFoo.includes("cid-wk01-work"), "Parent /work session must NOT leak into /work/foo filter");
+
+findButtonsByText("展开历史空闲会话 (1)")[0].onclick();
+await flushMicrotasks();
+const listWorkFoo = findSessionListEl().textContent;
+assert.ok(listWorkFoo.includes("#cid-fw02"), "/work/foo session must appear in list");
+assert.ok(!listWorkFoo.includes("#cid-wk01"), "Parent /work session must NOT appear in /work/foo list");
+findButtonsByText("收起历史空闲会话 (1)")[0].onclick();
+await flushMicrotasks();
+
+findButtonsByText("刷新")[0].onclick();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1, "Manual refresh after dropdown selection must query server");
+assert.deepEqual(pendingToolCalls[0].arguments, { workspace_path: "/work/foo" });
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "manual /work/foo" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooWork],
+    }),
+    workspaceFilter: "/work/foo",
+    workspaceOptions: [{ key: "/work/foo", label: "foo (/work/foo)" }],
+  },
+});
+await flushMicrotasks();
+
+const wsSelAfterRefresh = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+assert.ok(wsSelAfterRefresh.children.some((o) => o.value === "/work"), "Sibling /work option must persist after filtered refresh");
+wsSelAfterRefresh.value = "";
+wsSelAfterRefresh.onchange();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1, "Switching back to All must trigger unfiltered refresh");
+assert.deepEqual(pendingToolCalls[0].arguments, {});
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "restored all" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooProj, idleFooWork, idleWorkParent, idleNoWs],
+    }),
+    workspaceFilter: null,
+    workspaceOptions: disambigWithParent,
+  },
+});
+await flushMicrotasks();
+
+// Filter to __none__ shows only unassociated session without touching binding
+const wsSelNone = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+wsSelNone.value = "__none__";
+wsSelNone.onchange();
+await flushMicrotasks();
+findButtonsByText("展开历史空闲会话 (1)")[0].onclick();
+await flushMicrotasks();
+assert.ok(findSessionListEl().textContent.includes("#cid-nw03"));
+assert.ok(!findSessionListEl().textContent.includes("#cid-fp01"));
+
+// 8b. Copying untruncated >340-char Q10/option #14 preserves tail caveat marker verbatim
+const clipboardWrites = [];
+fakeNavigator.clipboard = {
+  async writeText(txt) {
+    clipboardWrites.push(String(txt));
+  },
+};
+const tailOptMarker = "OPT_TAIL_GUARD_99";
+const longOpt14 = "L".repeat(345) + tailOptMarker;
+const largeMultiQSession = {
+  ...makeSessionItem("cid-large-mq", "在聊天框回答选择题：Q1 prompt？（共 10 个问题）", null, {
+    workspaceName: "foo",
+  }),
+  workspaceKey: "/projects/foo",
+  workspacePaths: ["/projects/foo"],
+  sourceType: "APPROVAL_REQUIRED",
+  lifecycle: "WAITING_USER_DECISION",
+  questions: [
+    ...Array.from({ length: 9 }, (_, i) => ({
+      question: `Q${i + 1} prompt?`,
+      options: [`Q${i + 1}-A`],
+      multiSelect: false,
+    })),
+    {
+      question: "Q10 final prompt?",
+      options: [...Array.from({ length: 13 }, (_, j) => `Choice-${j + 1}`), longOpt14],
+      multiSelect: false,
+    },
+  ],
+};
+
+sendHostNotification("ui/notifications/tool-input", { arguments: {} });
+await flushMicrotasks();
+sendHostNotification("ui/notifications/tool-result", {
+  content: [{ type: "text", text: "large multi-q" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "hook_bound",
+      boundConversationId: "cid-large-mq",
+      selectedSession: largeMultiQSession,
+      sessions: [idleFooProj],
+    }),
+    workspaceOptions: disambigOpts,
+  },
+});
+await flushMicrotasks();
+
+assert.ok(renderedText().includes("Q10. Q10 final prompt?"), "10th question must render");
+const optButtons8 = findButtonsByText("复制选项");
+assert.equal(optButtons8.length, 23, "Expected 9 + 14 = 23 option copy buttons");
+optButtons8[optButtons8.length - 1].onclick();
+await flushMicrotasks();
+assert.equal(clipboardWrites.length, 1);
+assert.equal(clipboardWrites[0], longOpt14, "Copied option text must preserve full >340 char suffix");
+assert.ok(clipboardWrites[0].endsWith(tailOptMarker));
+console.log("[PASS] 8. Workspace disambiguation & filter retention, idle-only collapse, & untruncated Q10 copy");
+
+// 9. Hook-bound refresh ID guard, direct filtered A->B switch & stale discard, & disambiguated label persistence across single-ws refreshes
+const teamForkItem = makeSessionItem("team-fork", "Forked Action", "Forked Prompt");
+sendHostNotification("ui/notifications/tool-input", { arguments: {} });
+await flushMicrotasks();
+sendHostNotification("ui/notifications/tool-result", {
+  content: [{ type: "text", text: "team not found" }],
+  structuredContent: makePayload({
+    bindingMode: "hook_bound",
+    boundConversationId: "team",
+    sessionNotFound: true,
+    selectedSession: null,
+    sessions: [teamForkItem],
+  }),
+});
+await flushMicrotasks();
+assert.ok(renderedText().includes("已绑定当前会话 #team"));
+
+findButtonsByText("刷新")[0].onclick();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1);
+assert.deepEqual(pendingToolCalls[0].arguments, { conversation_id: "team" });
+// Even if a misbehaving server replied with a prefixed sibling, panel keeps exact hook_bound ID and hides sibling card
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "hijack attempt" }],
+  structuredContent: makePayload({
+    bindingMode: "explicit",
+    boundConversationId: "team-fork",
+    selectedSession: teamForkItem,
+    sessions: [teamForkItem],
+  }),
+});
+await flushMicrotasks();
+assert.ok(renderedText().includes("已绑定当前会话 #team"), "Hook-bound ID must not be rewritten to team-fork");
+assert.equal(findCards().length, 0, "Prefixed sibling detail card must never render for hook_bound session");
+
+// 9b. Auto-refresh off + filtered /projects/foo -> direct switch to /work/foo keeps disambiguated labels and ignores stale response
+sendHostNotification("ui/notifications/tool-input", { arguments: {} });
+await flushMicrotasks();
+sendHostNotification("ui/notifications/tool-result", {
+  content: [{ type: "text", text: "all disambig" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooProj, idleFooWork, idleNoWs],
+    }),
+    workspaceFilter: null,
+    workspaceOptions: disambigOpts,
+  },
+});
+await flushMicrotasks();
+
+findButtonsByText("自动刷新: 开")[0].onclick();
+await flushMicrotasks();
+assert.ok(findButtonsByText("自动刷新: 关").length === 1);
+
+const wsSel9 = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+wsSel9.value = "/projects/foo";
+wsSel9.onchange();
+await flushMicrotasks();
+findButtonsByText("刷新")[0].onclick();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1);
+assert.deepEqual(pendingToolCalls[0].arguments, { workspace_path: "/projects/foo" });
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "only /projects/foo" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooProj],
+    }),
+    workspaceFilter: "/projects/foo",
+    workspaceOptions: [{ key: "/projects/foo", label: "foo" }],
+  },
+});
+await flushMicrotasks();
+
+// Switch directly from filtered /projects/foo -> /work/foo; must issue immediate fetch & NOT show false empty-state
+const wsSel9Switch = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+wsSel9Switch.value = "/work/foo";
+wsSel9Switch.onchange();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1, "Switching filtered workspace A -> B must query server immediately");
+assert.deepEqual(pendingToolCalls[0].arguments, { workspace_path: "/work/foo" });
+
+// Resolve /work/foo with bare "foo" label; disambiguation must persist and idle session must load
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "only /work/foo" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooWork],
+    }),
+    workspaceFilter: "/work/foo",
+    workspaceOptions: [{ key: "/work/foo", label: "foo" }],
+  },
+});
+await flushMicrotasks();
+
+assert.ok(!renderedText().includes("暂无已记录的会话状态"), "Workspace B must render session list instead of empty error");
+findButtonsByText("展开历史空闲会话 (1)")[0].onclick();
+await flushMicrotasks();
+assert.ok(findSessionListEl().textContent.includes("#cid-fw02"));
+const wsSel9Labels = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0].children.map((o) => o._text);
+assert.ok(wsSel9Labels.some((t) => t.includes("foo (/projects/foo)")), "Single-ws refreshes must preserve /projects/foo disambiguation");
+assert.ok(wsSel9Labels.some((t) => t.includes("foo (/work/foo)")), "Single-ws refreshes must preserve /work/foo disambiguation");
+
+// Trigger manual refresh on /work/foo, switch to /projects/foo before it resolves, ensure stale /work/foo response is dropped
+findButtonsByText("刷新")[0].onclick();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1);
+assert.deepEqual(pendingToolCalls[0].arguments, { workspace_path: "/work/foo" });
+const wsSel9Race = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+wsSel9Race.value = "/projects/foo";
+wsSel9Race.onchange();
+await flushMicrotasks();
+// Stale /work/foo call resolves after user switched to /projects/foo -> ignored and coalesced /projects/foo runs cleanly
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "late /work/foo" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooWork],
+    }),
+    workspaceFilter: "/work/foo",
+    workspaceOptions: [{ key: "/work/foo", label: "foo" }],
+  },
+});
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1, "Expected coalesced follow-up refresh for /projects/foo");
+assert.deepEqual(pendingToolCalls[0].arguments, { workspace_path: "/projects/foo" });
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "fresh /projects/foo" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooProj],
+    }),
+    workspaceFilter: "/projects/foo",
+    workspaceOptions: [{ key: "/projects/foo", label: "foo" }],
+  },
+});
+await flushMicrotasks();
+assert.ok(findSessionListEl().textContent.includes("#cid-fp01"));
+assert.ok(!findSessionListEl().textContent.includes("#cid-fw02"));
+
+// 9c. Switching A (/projects/foo) -> All ("") -> B (/work/foo) before All settles must still enqueue & fetch B
+const wsSel9cAll = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+wsSel9cAll.value = "";
+wsSel9cAll.onchange();
+await flushMicrotasks();
+assert.equal(pendingToolCalls.length, 1);
+assert.deepEqual(pendingToolCalls[0].arguments, {});
+
+const wsSel9cB = appRoot.findAll(
+  (n) => n.tagName === "SELECT" && n.attributes.get("aria-label") === "按工作区筛选会话",
+)[0];
+wsSel9cB.value = "/work/foo";
+wsSel9cB.onchange();
+await flushMicrotasks();
+
+// Resolve the superseded {} response -> ignored, and coalesced follow-up query for /work/foo fires automatically
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "superseded all" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooProj, idleFooWork, idleNoWs],
+    }),
+    workspaceFilter: null,
+    workspaceOptions: disambigOpts,
+  },
+});
+await flushMicrotasks();
+
+assert.equal(pendingToolCalls.length, 1, "A->All->B before All settles must enqueue follow-up fetch for B");
+assert.deepEqual(pendingToolCalls[0].arguments, { workspace_path: "/work/foo" });
+pendingToolCalls.shift().resolve({
+  content: [{ type: "text", text: "settled B" }],
+  structuredContent: {
+    ...makePayload({
+      bindingMode: "unbound",
+      boundConversationId: null,
+      selectedSession: null,
+      sessions: [idleFooWork],
+    }),
+    workspaceFilter: "/work/foo",
+    workspaceOptions: [{ key: "/work/foo", label: "foo" }],
+  },
+});
+await flushMicrotasks();
+assert.ok(findSessionListEl().textContent.includes("#cid-fw02"), "Workspace B session must render after coalesced fetch");
+console.log("[PASS] 9. Hook-bound refresh guard, filtered A->B / A->All->B switch & stale discard, & disambiguated label persistence");
 
 console.log(`ALL SIDE PANEL BUNDLE CHECKS PASSED (total RPC calls=${recordedToolCalls.length}, maxConcurrent=${maxConcurrentRpc})`);
